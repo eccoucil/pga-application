@@ -1,0 +1,45 @@
+# Environment & Secrets
+.env
+.env.local
+.env*.local
+*.pem
+
+# AI / Editor Tool Artifacts
+.claude/
+.cursor/
+.playwright-mcp/
+
+# Development Notes (temporary analysis files)
+thoughts/
+BACKEND_ANALYSIS.md
+EXPLORATION_RESULTS.md
+NEO4J_SCHEMA.md
+PLAN.md
+
+# OS Files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Dependencies (belt-and-suspenders with sub-gitignores)
+node_modules/
+.venv/
+venv/
+__pycache__/
+
+# Build
+.next/
+out/
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*

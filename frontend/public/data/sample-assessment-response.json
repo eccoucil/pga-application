@@ -1,0 +1,232 @@
+{
+  "assessment_id": "550e8400-e29b-41d4-a716-446655440000",
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "documents_received": 2,
+  "status": "received",
+  "documents": [
+    {
+      "document_id": "770e8400-e29b-41d4-a716-446655440002",
+      "filename": "security-policy.pdf",
+      "status": "processed",
+      "extracted_text_length": 15420,
+      "findings_count": 8
+    },
+    {
+      "document_id": "770e8400-e29b-41d4-a716-446655440003",
+      "filename": "access-control.docx",
+      "status": "pending",
+      "extracted_text_length": 0,
+      "findings_count": 0
+    }
+  ],
+  "web_crawl": {
+    "success": true,
+    "pages_crawled": 12,
+    "digital_assets_found": 5,
+    "business_context_extracted": true,
+    "organization_info_extracted": true,
+    "confidence_score": 0.87,
+    "errors": [],
+    "from_cache": false
+  },
+  "organization_context": {
+    "created": true,
+    "organization_id": "4:abc123:0",
+    "organization_name": "Apex Financial Services",
+    "industry_type": "Banking & Financial Services",
+    "industry_sector": "Financial Services",
+    "department": "Information Technology",
+    "scope_statement_preview": "ISMS covers all customer-facing digital banking systems, core banking infrastructure, and data proc...",
+    "web_domain": "apexfinancial.com.my",
+    "context_nodes": [
+      {
+        "node_id": "4:abc123:0",
+        "node_type": "Organization",
+        "name": "Apex Financial Services"
+      },
+      {
+        "node_id": "4:def456:1",
+        "node_type": "Industry",
+        "name": "Banking & Financial Services"
+      },
+      {
+        "node_id": "4:ghi789:2",
+        "node_type": "Department",
+        "name": "Information Technology"
+      },
+      {
+        "node_id": "4:jkl012:3",
+        "node_type": "ISMSScope",
+        "name": null
+      },
+      {
+        "node_id": "4:mno345:4",
+        "node_type": "BusinessContext",
+        "name": null
+      }
+    ],
+    "context_nodes_created": [
+      "Organization",
+      "Industry",
+      "Department",
+      "ISMSScope",
+      "BusinessContext"
+    ]
+  },
+  "knowledge_graph": {
+    "nodes": [
+      {
+        "id": "4:abc123:0",
+        "type": "organization",
+        "position": { "x": 400, "y": 300 },
+        "data": {
+          "label": "Apex Financial Services",
+          "node_type": "Organization",
+          "neo4j_id": "4:abc123:0",
+          "properties": {
+            "industry_type": "Banking & Financial Services",
+            "department": "Information Technology",
+            "web_domain": "apexfinancial.com.my"
+          }
+        }
+      },
+      {
+        "id": "4:def456:1",
+        "type": "industry",
+        "position": { "x": 650, "y": 300 },
+        "data": {
+          "label": "Banking & Financial Services",
+          "node_type": "Industry",
+          "neo4j_id": "4:def456:1",
+          "properties": {}
+        }
+      },
+      {
+        "id": "4:ghi789:2",
+        "type": "department",
+        "position": { "x": 525, "y": 517 },
+        "data": {
+          "label": "Information Technology",
+          "node_type": "Department",
+          "neo4j_id": "4:ghi789:2",
+          "properties": {}
+        }
+      },
+      {
+        "id": "4:jkl012:3",
+        "type": "scope",
+        "position": { "x": 275, "y": 517 },
+        "data": {
+          "label": "ISMSScope",
+          "node_type": "ISMSScope",
+          "neo4j_id": "4:jkl012:3",
+          "properties": {}
+        }
+      },
+      {
+        "id": "4:mno345:4",
+        "type": "context",
+        "position": { "x": 150, "y": 300 },
+        "data": {
+          "label": "BusinessContext",
+          "node_type": "BusinessContext",
+          "neo4j_id": "4:mno345:4",
+          "properties": {}
+        }
+      },
+      {
+        "id": "asset-0",
+        "type": "asset",
+        "position": { "x": 275, "y": 83 },
+        "data": {
+          "label": "Online Banking Portal",
+          "node_type": "DigitalAsset",
+          "neo4j_id": null,
+          "properties": {
+            "url": "https://banking.apexfinancial.com.my",
+            "asset_type": "portal",
+            "purpose": "Customer online banking access"
+          }
+        }
+      },
+      {
+        "id": "asset-1",
+        "type": "asset",
+        "position": { "x": 525, "y": 83 },
+        "data": {
+          "label": "API Gateway",
+          "node_type": "DigitalAsset",
+          "neo4j_id": null,
+          "properties": {
+            "url": "https://api.apexfinancial.com.my",
+            "asset_type": "api",
+            "purpose": "Third-party integration endpoint"
+          }
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e-4:abc123:0-4:def456:1",
+        "source": "4:abc123:0",
+        "target": "4:def456:1",
+        "type": "smoothstep",
+        "label": "IN_INDUSTRY",
+        "animated": false
+      },
+      {
+        "id": "e-4:abc123:0-4:ghi789:2",
+        "source": "4:abc123:0",
+        "target": "4:ghi789:2",
+        "type": "smoothstep",
+        "label": "HAS_DEPARTMENT",
+        "animated": false
+      },
+      {
+        "id": "e-4:abc123:0-4:jkl012:3",
+        "source": "4:abc123:0",
+        "target": "4:jkl012:3",
+        "type": "smoothstep",
+        "label": "HAS_SCOPE",
+        "animated": false
+      },
+      {
+        "id": "e-4:abc123:0-4:mno345:4",
+        "source": "4:abc123:0",
+        "target": "4:mno345:4",
+        "type": "smoothstep",
+        "label": "HAS_BUSINESS_CONTEXT",
+        "animated": false
+      },
+      {
+        "id": "e-4:abc123:0-asset-0",
+        "source": "4:abc123:0",
+        "target": "asset-0",
+        "type": "smoothstep",
+        "label": "HAS_ASSET",
+        "animated": true
+      },
+      {
+        "id": "e-4:abc123:0-asset-1",
+        "source": "4:abc123:0",
+        "target": "asset-1",
+        "type": "smoothstep",
+        "label": "HAS_ASSET",
+        "animated": true
+      }
+    ]
+  },
+  "summary": {
+    "headline": "Assessment received for Apex Financial Services",
+    "processing_time_ms": 4523,
+    "highlights": [
+      "2 document(s) received, 1 processed",
+      "12 pages crawled",
+      "5 digital assets discovered",
+      "Business context extracted",
+      "Organization info extracted"
+    ],
+    "next_step": "review_findings",
+    "next_step_url": "/clients/123/projects/456/findings"
+  }
+}
