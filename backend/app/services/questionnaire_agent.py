@@ -1,0 +1,1285 @@
+"""Questionnaire Agent — conversational compliance question generator.
+
+Uses Claude Opus 4.6 with tool_use to interview the user about their
+question generation criteria, then generates tailored compliance questions
+for all selected framework controls.
+"""
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Optional
+
+import anthropic
+import httpx
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from fastapi import HTTPException
+
+from app.config import get_settings
+from app.models.questionnaire import (
+    AgentQuestion,
+    ControlQuestions,
+    GeneratedQuestion,
+    QuestionnaireComplete,
+    QuestionnaireResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+# Claude model for question generation
+DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
+MAX_TOKENS = 8192
+CRITERIA_MAX_TOKENS = 8192  # Batch generation needs much more output space
+
+# Tool definition for the conversational loop
+TOOLS = [
+    {
+        "name": "askQuestionToMe",
+        "description": (
+            "Ask the user a clarifying question about how compliance questions "
+            "should be generated. Use this to understand their priorities, focus "
+            "areas, depth preferences, and any specific concerns before generating "
+            "questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask the user",
+                },
+                "context": {
+                    "type": "string",
+                    "description": (
+                        "Brief explanation of why this information helps "
+                        "generate better questions"
+                    ),
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional suggested answers (user can also give free-text)"
+                    ),
+                },
+            },
+            "required": ["question"],
+        },
+    }
+]
+
+
+@dataclass
+class QuestionnaireSession:
+    """In-memory state for an active questionnaire session."""
+
+    session_id: str
+    project_id: str
+    client_id: str
+    user_id: str
+    assessment_id: Optional[str] = None
+    messages: list[dict] = field(default_factory=list)
+    pending_tool_use_id: Optional[str] = None
+    project_context: dict = field(default_factory=dict)
+    system_prompt: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    started_at_ms: int = 0
+    status: str = "active"
+
+
+# Session store (in-memory; sessions lost on restart)
+_sessions: dict[str, QuestionnaireSession] = {}
+
+# Singleton
+_agent: Optional["QuestionnaireAgent"] = None
+_agent_lock = asyncio.Lock()
+
+
+async def get_questionnaire_agent() -> "QuestionnaireAgent":
+    """Get or create the singleton QuestionnaireAgent."""
+    global _agent
+    if _agent is not None:
+        return _agent
+    async with _agent_lock:
+        if _agent is None:
+            _agent = QuestionnaireAgent()
+        return _agent
+
+
+class QuestionnaireAgent:
+    """Conversational agent that interviews users then generates questions."""
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        self._model = settings.claude_model or DEFAULT_MODEL
+        
+        # Diagnostic logging
+        key_exists = bool(settings.anthropic_api_key)
+        key_len = len(settings.anthropic_api_key) if settings.anthropic_api_key else 0
+        logger.info(f"Initializing QuestionnaireAgent with model: {self._model}")
+        logger.info(f"Anthropic API key exists: {key_exists}, length: {key_len}")
+        
+        # Disable HTTP/2 to avoid connection issues on some networks (common Mac issue)
+        # Use a custom httpx client for more control
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=30.0, read=570.0),
+            http2=False, # Force HTTP/1.1
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)
+        )
+        
+        self._client = anthropic.AsyncAnthropic(
+            api_key=settings.anthropic_api_key,
+            http_client=http_client
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def start_session(
+        self, project_id: str, user_id: str, assessment_id: str | None = None
+    ) -> QuestionnaireResponse:
+        """Start a new questionnaire session.
+
+        Fetches project context in parallel, builds the system prompt, and
+        makes the first Claude call.  The agent will typically use the
+        ``askQuestionToMe`` tool to ask the user a clarifying question.
+        """
+        session_id = str(uuid.uuid4())
+        started_at = int(time.time() * 1000)
+
+        # Fetch all context in parallel
+        context = await self._fetch_project_context(project_id)
+
+        client_id = context.get("client_id", "")
+        system_prompt = self._build_system_prompt(context)
+
+        session = QuestionnaireSession(
+            session_id=session_id,
+            project_id=project_id,
+            client_id=client_id,
+            user_id=user_id,
+            assessment_id=assessment_id,
+            system_prompt=system_prompt,
+            project_context=context,
+            started_at_ms=started_at,
+        )
+
+        # Initial user message to kick off the conversation
+        session.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "I'd like to generate compliance assessment questions for "
+                    "this project. Please start by understanding my requirements."
+                ),
+            }
+        )
+
+        _sessions[session_id] = session
+        return await self._call_agent(session)
+
+    async def generate_with_criteria(
+        self,
+        project_id: str,
+        user_id: str,
+        maturity_level: str,
+        question_depth: str,
+        priority_domains: list[str],
+        compliance_concerns: str | None = None,
+        controls_to_skip: str | None = None,
+        assessment_id: str | None = None,
+    ) -> QuestionnaireComplete:
+        """Generate questions from structured wizard criteria (no chat loop).
+
+        Fetches project context, builds a criteria-enriched prompt, and calls
+        Claude in batches to generate questions for all controls.
+        """
+        session_id = str(uuid.uuid4())
+        started_at = int(time.time() * 1000)
+
+        context = await self._fetch_project_context(project_id)
+        client_id = context.get("client_id", "")
+
+        # Prepare for batching
+        iso_controls = context.get("iso_controls", [])
+        bnm_controls = context.get("bnm_controls", [])
+        
+        # Combine controls with domain/section metadata for filtering
+        all_controls = []
+        for c in iso_controls:
+            identifier = c.get("identifier", "")
+            # Derive domain prefix (e.g. "A.5" from "A.5.1")
+            parts = identifier.split(".")
+            if len(parts) >= 2 and parts[0] == "A":
+                domain = f"A.{parts[1]}"
+            else:
+                # Management clauses (4-10) are plain integers
+                domain = identifier.split(".")[0] if identifier else ""
+            all_controls.append({
+                "id": identifier,
+                "title": c.get("title"),
+                "framework": "ISO 27001:2022",
+                "desc": c.get("description", ""),
+                "domain": domain,
+            })
+        for c in bnm_controls:
+            all_controls.append({
+                "id": c.get("reference_id"),
+                "title": c.get("title"),
+                "framework": "BNM RMIT",
+                "desc": c.get("description", ""),
+                "section_title": c.get("section_title", ""),
+            })
+
+        # Filter controls when priority_domains is specified
+        if priority_domains:
+            all_controls = self._filter_controls(all_controls, priority_domains)
+            logger.info(
+                f"Filtered to {len(all_controls)} controls for priority domains: {priority_domains}"
+            )
+
+        if not all_controls:
+            logger.warning(f"No controls found for project {project_id}")
+            return QuestionnaireComplete(
+                session_id=session_id,
+                controls=[],
+                total_controls=0,
+                total_questions=0,
+                generation_time_ms=int(time.time() * 1000) - started_at,
+                criteria_summary="No controls selected"
+            )
+
+        # Split controls into batches of 15 to stay within token limits
+        batch_size = 15
+        batches = [all_controls[i:i + batch_size] for i in range(0, len(all_controls), batch_size)]
+        
+        all_generated_controls = []
+        
+        criteria_summary = self._build_criteria_summary(
+            maturity_level=maturity_level,
+            question_depth=question_depth,
+            priority_domains=priority_domains,
+            compliance_concerns=compliance_concerns,
+            controls_to_skip=controls_to_skip,
+        )
+
+        session = QuestionnaireSession(
+            session_id=session_id,
+            project_id=project_id,
+            client_id=client_id,
+            user_id=user_id,
+            assessment_id=assessment_id,
+            project_context=context,
+            started_at_ms=started_at,
+        )
+        _sessions[session_id] = session
+
+        logger.info(f"Starting batch generation for {len(all_controls)} controls in {len(batches)} batches")
+
+        for i, batch in enumerate(batches):
+            logger.info(f"Processing batch {i+1}/{len(batches)} ({len(batch)} controls)")
+            
+            # Format this batch's controls
+            batch_controls_text = ""
+            for c in batch:
+                batch_controls_text += f"- **{c['id']}**: {c['title']} — {c['desc'][:200]}\n"
+
+            # Build a specialized prompt for this batch
+            batch_system_prompt = self._build_batch_system_prompt(
+                context,
+                batch_controls_text,
+                maturity_level=maturity_level,
+                question_depth=question_depth,
+                priority_domains=priority_domains,
+                compliance_concerns=compliance_concerns,
+                controls_to_skip=controls_to_skip,
+            )
+            
+            # Update session's system prompt for this call (for logging/history)
+            session.system_prompt = batch_system_prompt
+            
+            try:
+                response = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=CRITERIA_MAX_TOKENS,
+                    system=batch_system_prompt,
+                    messages=[
+                        {"role": "user", "content": "Generate the compliance assessment questions for these specific controls."}
+                    ],
+                )
+                
+                # Parse questions from this batch
+                text = ""
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        text += block.text
+                
+                batch_controls = self._parse_questions(text, session_id)
+                all_generated_controls.extend(batch_controls)
+                
+                # Store message in history (optional, might get large)
+                session.messages.append({"role": "assistant", "content": f"Batch {i+1} generated."})
+                
+            except Exception as e:
+                logger.error(f"Error in batch {i+1}: {e}")
+                # Continue with next batch if one fails, or we could stop
+                continue
+
+        # Final result assembly
+        total_questions = sum(len(c.questions) for c in all_generated_controls)
+        elapsed_ms = int(time.time() * 1000) - started_at
+        session.status = "completed"
+
+        # Persist all results
+        await self._persist_results(
+            session, all_generated_controls, total_questions, elapsed_ms, criteria_summary
+        )
+
+        return QuestionnaireComplete(
+            session_id=session_id,
+            controls=all_generated_controls,
+            total_controls=len(all_generated_controls),
+            total_questions=total_questions,
+            generation_time_ms=elapsed_ms,
+            criteria_summary=criteria_summary,
+        )
+
+    def _build_batch_system_prompt(
+        self,
+        context: dict,
+        batch_controls_text: str,
+        *,
+        maturity_level: str,
+        question_depth: str,
+        priority_domains: list[str],
+        compliance_concerns: str | None,
+        controls_to_skip: str | None,
+    ) -> str:
+        """Build system prompt for a specific batch of controls."""
+        org_name = context.get("organization_name", "the organization")
+        industry = context.get("industry", "unspecified")
+
+        # Map depth to question count
+        depth_map = {
+            "high_level_overview": "2 questions per control",
+            "balanced": "3 questions per control",
+            "detailed_technical": "4-5 questions per control",
+        }
+        q_count = depth_map.get(question_depth, "3 questions per control")
+
+        # Map maturity to complexity guidance
+        maturity_map = {
+            "first_time_audit": (
+                "Focus on policy existence, basic documentation, and foundational "
+                "controls. Use straightforward language. Prioritize 'do you have' "
+                "over 'how effective is' questions."
+            ),
+            "recurring_assessment": (
+                "Focus on implementation effectiveness, monitoring, and evidence "
+                "of ongoing compliance. Ask about metrics, review cycles, and "
+                "continuous improvement."
+            ),
+            "mature_isms": (
+                "Focus on advanced effectiveness, optimization, and continuous "
+                "improvement. Ask about benchmarking, automation, integration "
+                "with business processes, and proactive threat management."
+            ),
+        }
+        maturity_guidance = maturity_map.get(
+            maturity_level, maturity_map["recurring_assessment"]
+        )
+
+        # Priority domains section
+        priority_section = ""
+        if priority_domains:
+            priority_section = (
+                f"\n\n## Priority Focus Areas\n"
+                f"Generate MORE detailed and in-depth questions for these domains: "
+                f"{', '.join(priority_domains)}. "
+                f"For other domains, still generate questions but at standard depth."
+            )
+
+        # Compliance concerns section
+        concerns_section = ""
+        if compliance_concerns:
+            concerns_section = (
+                f"\n\n## Specific Compliance Concerns\n"
+                f"The organization has flagged these concerns: {compliance_concerns}\n"
+                f"Incorporate targeted questions that address these specific gaps "
+                f"within relevant controls."
+            )
+
+        # Controls to skip
+        skip_section = ""
+        if controls_to_skip:
+            skip_section = (
+                f"\n\n## Controls to De-emphasize\n"
+                f"Reduce coverage for: {controls_to_skip}. "
+                f"Generate only 1 basic question for these controls."
+            )
+
+        return f"""You are a Senior ISMS Compliance Consultant & Auditor.
+Organization: {org_name} ({industry})
+
+## Controls to Process
+{batch_controls_text}
+
+## Assessment Criteria
+Maturity Level: {maturity_level.replace('_', ' ').title()}
+Question Depth: {q_count}
+Complexity Guidance: {maturity_guidance}{priority_section}{concerns_section}{skip_section}
+
+## Instructions
+Generate questions for the specific controls listed above. Output ONLY a JSON array with this schema:
+[
+  {{
+    "control_id": "ID",
+    "control_title": "Title",
+    "framework": "Framework Name",
+    "questions": [
+      {{
+        "id": "q-<unique-id>",
+        "question": "The question text",
+        "category": "policy_existence|implementation|monitoring|effectiveness|documentation",
+        "priority": "high|medium|low",
+        "expected_evidence": "Expected evidence",
+        "guidance_notes": "Guidance notes"
+      }}
+    ]
+  }}
+]
+
+Ensure questions are specific to {org_name}'s context."""
+
+    @retry(
+        retry=retry_if_exception_type(
+            (anthropic.RateLimitError, anthropic.APITimeoutError)
+        ),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    async def _call_criteria_generation(
+        self, session: QuestionnaireSession
+    ) -> anthropic.types.Message:
+        """Call Claude without tools for direct question generation."""
+        response = await self._client.messages.create(
+            model=self._model,
+            max_tokens=CRITERIA_MAX_TOKENS,
+            system=session.system_prompt,
+            messages=session.messages,
+        )
+        logger.info(
+            f"Session {session.session_id}: stop_reason={response.stop_reason}, "
+            f"output_tokens={response.usage.output_tokens}"
+        )
+        session.messages.append(
+            {"role": "assistant", "content": response.content}
+        )
+        return response
+
+    async def continue_session(
+        self, session_id: str, answer: str
+    ) -> QuestionnaireResponse:
+        """Continue a session by feeding the user's answer back to Claude.
+
+        The answer is wrapped as a ``tool_result`` for the pending
+        ``askQuestionToMe`` tool call.
+        """
+        session = _sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Session {session_id} not found or expired")
+        if session.status != "active":
+            raise ValueError(f"Session {session_id} is already {session.status}")
+        if session.pending_tool_use_id is None:
+            raise ValueError("No pending question to answer")
+
+        # Append the tool_result message
+        session.messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": session.pending_tool_use_id,
+                        "content": answer,
+                    }
+                ],
+            }
+        )
+        session.pending_tool_use_id = None
+
+        return await self._call_agent(session)
+
+    # ------------------------------------------------------------------
+    # Context fetching (parallel)
+    # ------------------------------------------------------------------
+
+    async def _fetch_project_context(self, project_id: str) -> dict:
+        """Fetch all context needed for question generation in parallel."""
+        from app.db.supabase import get_async_supabase_client_async
+
+        sb = await get_async_supabase_client_async()
+
+        # Phase 1: Fetch project + project-scoped data in parallel
+        (
+            project_res,
+            findings_res,
+            crawl_res,
+        ) = await asyncio.gather(
+            sb.table("projects").select("*").eq("id", project_id).execute(),
+            sb.table("gap_analysis_findings")
+            .select("*")
+            .eq("project_id", project_id)
+            .execute(),
+            sb.table("web_crawl_results")
+            .select("*")
+            .eq("project_id", project_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute(),
+            return_exceptions=True,
+        )
+
+        context: dict[str, Any] = {"project_id": project_id}
+
+        # Project
+        if not isinstance(project_res, Exception) and project_res.data:
+            project = project_res.data[0]
+            context["project_name"] = project.get("name", "")
+            context["client_id"] = project.get("client_id", "")
+            raw = project.get("framework") or []
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except (ValueError, TypeError):
+                    raw = [raw] if raw else []
+            context["selected_frameworks"] = raw if isinstance(raw, list) else []
+        else:
+            context["client_id"] = ""
+            context["selected_frameworks"] = []
+
+        frameworks = context["selected_frameworks"]
+
+        # Phase 2: Fetch client info + only needed framework controls
+        phase2_coros: list = []
+        phase2_keys: list[str] = []
+
+        client_id = context.get("client_id", "")
+        if client_id:
+            phase2_coros.append(
+                sb.table("clients").select("*").eq("id", client_id).execute()
+            )
+            phase2_keys.append("client")
+
+        if not frameworks or "ISO 27001:2022" in frameworks:
+            phase2_coros.append(
+                sb.table("iso_requirements").select("*").execute()
+            )
+            phase2_keys.append("iso")
+
+        if not frameworks or "BNM RMIT" in frameworks:
+            phase2_coros.append(
+                sb.table("bnm_rmit_requirements").select("*").execute()
+            )
+            phase2_keys.append("bnm")
+
+        if phase2_coros:
+            phase2_results = await asyncio.gather(
+                *phase2_coros, return_exceptions=True
+            )
+            phase2_map = dict(zip(phase2_keys, phase2_results))
+        else:
+            phase2_map = {}
+
+        # Client info
+        client_res = phase2_map.get("client")
+        if client_res and not isinstance(client_res, Exception) and client_res.data:
+            client = client_res.data[0]
+            context["organization_name"] = client.get("name", "")
+            context["industry"] = client.get("industry", "")
+
+        # Findings
+        if not isinstance(findings_res, Exception) and findings_res.data:
+            context["findings"] = findings_res.data
+        else:
+            context["findings"] = []
+
+        # Web crawl results
+        if not isinstance(crawl_res, Exception) and crawl_res.data:
+            crawl = crawl_res.data[0]
+            context["business_context"] = crawl.get("business_context", {})
+            context["digital_assets"] = crawl.get("digital_assets", [])
+        else:
+            context["business_context"] = {}
+            context["digital_assets"] = []
+
+        # Framework controls (only fetched if needed)
+        iso_res = phase2_map.get("iso")
+        if iso_res and not isinstance(iso_res, Exception) and iso_res.data:
+            context["iso_controls"] = iso_res.data
+        else:
+            context["iso_controls"] = []
+
+        bnm_res = phase2_map.get("bnm")
+        if bnm_res and not isinstance(bnm_res, Exception) and bnm_res.data:
+            context["bnm_controls"] = bnm_res.data
+        else:
+            context["bnm_controls"] = []
+
+        # Neo4j organization context (optional, non-blocking)
+        try:
+            from app.services.neo4j_service import get_neo4j_service
+
+            neo4j = get_neo4j_service()
+            org_context = await neo4j.get_organization_context(
+                client_id, project_id
+            )
+            if org_context:
+                context["neo4j_context"] = org_context
+        except Exception as e:
+            logger.warning(f"Neo4j context fetch failed (non-critical): {e}")
+
+        # Qdrant document chunks (optional, non-blocking)
+        try:
+            from app.services.qdrant_service import get_qdrant_service
+
+            qdrant = get_qdrant_service()
+            chunks = await qdrant.search_company_extractions(
+                client_id=client_id,
+                query="compliance policy information security",
+                limit=10,
+            )
+            context["document_chunks"] = chunks
+        except Exception as e:
+            logger.warning(f"Qdrant search failed (non-critical): {e}")
+
+        return context
+
+    # ------------------------------------------------------------------
+    # System prompt
+    # ------------------------------------------------------------------
+
+    def _build_system_prompt(self, context: dict) -> str:
+        """Build the agent system prompt with role, context, and instructions."""
+        org_name = context.get("organization_name", "the organization")
+        industry = context.get("industry", "unspecified")
+        frameworks = context.get("selected_frameworks", [])
+        business_ctx = context.get("business_context", {})
+        findings = context.get("findings", [])
+        neo4j_ctx = context.get("neo4j_context", {})
+
+        # Summarise documents from Neo4j context
+        docs = neo4j_ctx.get("documents", []) if isinstance(neo4j_ctx, dict) else []
+        doc_names = [d.get("filename", "unknown") for d in docs if d]
+
+        # Build framework controls section
+        controls_text = self._format_controls(context)
+
+        # Business context summary
+        biz_summary = ""
+        if business_ctx:
+            biz_summary = json.dumps(business_ctx, default=str)[:2000]
+
+        # Findings summary
+        findings_summary = f"{len(findings)} existing findings" if findings else "No existing findings"
+
+        scope_stmt = ""
+        if isinstance(neo4j_ctx, dict):
+            scope_stmt = neo4j_ctx.get("scope_statement_isms", "")
+
+        return f"""You are a Senior ISMS Compliance Consultant & Auditor.
+
+Goal: Generate targeted, actionable compliance assessment questions specific to the organization's context, industry, and regulatory landscape.
+
+Backstory: You have 15+ years of experience conducting compliance audits for financial institutions across Southeast Asia, specializing in {' and '.join(frameworks) if frameworks else 'BNM RMIT and ISO 27001:2022'}. You understand that generic questionnaires produce generic results — the best assessments are tailored to the organization's specific risks, maturity, and operational context.
+
+## Project Context
+Organization: {org_name} ({industry})
+Frameworks: {', '.join(frameworks) if frameworks else 'Not specified'}
+Business Context: {biz_summary or 'Not available'}
+ISMS Scope: {scope_stmt or 'Not specified'}
+Documents Uploaded: {len(doc_names)} ({', '.join(doc_names[:10]) if doc_names else 'none'})
+Existing Findings: {findings_summary}
+
+## Framework Controls
+{controls_text}
+
+## Instructions
+1. First, use the askQuestionToMe tool to understand the user's criteria for question generation. Key areas to explore:
+   - Question depth preference (high-level overview vs detailed technical questions)
+   - Priority focus areas (which control domains matter most)
+   - Specific compliance concerns or known gaps
+   - Assessment maturity level (first-time vs recurring audit)
+   - Any controls to skip or emphasize
+2. Ask 2-4 clarifying questions total. Ask them one at a time — ask, listen to the answer, then decide if you need more context.
+3. Once you have enough context, generate questions for EVERY control in the selected frameworks.
+4. When you are done asking questions and ready to generate, output your response as a JSON array of objects with this exact schema:
+
+```json
+[
+  {{
+    "control_id": "A.5.1",
+    "control_title": "Policies for information security",
+    "framework": "ISO 27001:2022",
+    "questions": [
+      {{
+        "id": "q-<unique-id>",
+        "question": "The assessment question text",
+        "category": "policy_existence|implementation|monitoring|effectiveness|documentation",
+        "priority": "high|medium|low",
+        "expected_evidence": "What evidence the assessor should look for",
+        "guidance_notes": "Hints for the assessor on evaluating the answer"
+      }}
+    ]
+  }}
+]
+```
+
+Generate 2-5 questions per control depending on the user's depth preference. Ensure questions are specific to {org_name}'s context, not generic boilerplate."""
+
+    def _format_controls(self, context: dict) -> str:
+        """Format framework controls for the system prompt."""
+        parts = []
+        frameworks = context.get("selected_frameworks", [])
+
+        if not frameworks or "ISO 27001:2022" in frameworks:
+            iso_controls = context.get("iso_controls", [])
+            if iso_controls:
+                parts.append("### ISO 27001:2022 Controls")
+                for c in iso_controls[:100]:  # Hard limit to 100 to avoid overflow
+                    identifier = c.get("identifier", "")
+                    title = c.get("title", "")
+                    desc = c.get("description", "")[:150]
+                    parts.append(f"- **{identifier}**: {title} — {desc}")
+
+        if not frameworks or "BNM RMIT" in frameworks:
+            bnm_controls = context.get("bnm_controls", [])
+            if bnm_controls:
+                parts.append("\n### BNM RMIT Controls")
+                for c in bnm_controls[:100]: # Hard limit to 100
+                    ref = c.get("reference_id", "")
+                    title = c.get("title", "")
+                    desc = c.get("requirement_text", "")[:150] # Fixed key name
+                    parts.append(f"- **{ref}**: {title} — {desc}")
+
+        return "\n".join(parts) if parts else "No framework controls loaded."
+
+    def _build_criteria_system_prompt(
+        self,
+        context: dict,
+        *,
+        maturity_level: str,
+        question_depth: str,
+        priority_domains: list[str],
+        compliance_concerns: str | None,
+        controls_to_skip: str | None,
+    ) -> str:
+        """Build system prompt with structured criteria baked in."""
+        org_name = context.get("organization_name", "the organization")
+        industry = context.get("industry", "unspecified")
+        frameworks = context.get("selected_frameworks", [])
+        business_ctx = context.get("business_context", {})
+        findings = context.get("findings", [])
+        neo4j_ctx = context.get("neo4j_context", {})
+
+        docs = neo4j_ctx.get("documents", []) if isinstance(neo4j_ctx, dict) else []
+        doc_names = [d.get("filename", "unknown") for d in docs if d]
+        controls_text = self._format_controls(context)
+        biz_summary = ""
+        if business_ctx:
+            biz_summary = json.dumps(business_ctx, default=str)[:2000]
+        findings_summary = (
+            f"{len(findings)} existing findings" if findings else "No existing findings"
+        )
+        scope_stmt = ""
+        if isinstance(neo4j_ctx, dict):
+            scope_stmt = neo4j_ctx.get("scope_statement_isms", "")
+
+        # Map depth to question count
+        depth_map = {
+            "high_level_overview": "2 questions per control",
+            "balanced": "3 questions per control",
+            "detailed_technical": "4-5 questions per control",
+        }
+        q_count = depth_map.get(question_depth, "3 questions per control")
+
+        # Map maturity to complexity guidance
+        maturity_map = {
+            "first_time_audit": (
+                "Focus on policy existence, basic documentation, and foundational "
+                "controls. Use straightforward language. Prioritize 'do you have' "
+                "over 'how effective is' questions."
+            ),
+            "recurring_assessment": (
+                "Focus on implementation effectiveness, monitoring, and evidence "
+                "of ongoing compliance. Ask about metrics, review cycles, and "
+                "continuous improvement."
+            ),
+            "mature_isms": (
+                "Focus on advanced effectiveness, optimization, and continuous "
+                "improvement. Ask about benchmarking, automation, integration "
+                "with business processes, and proactive threat management."
+            ),
+        }
+        maturity_guidance = maturity_map.get(maturity_level, maturity_map["recurring_assessment"])
+
+        # Priority domains section
+        priority_section = ""
+        if priority_domains:
+            priority_section = (
+                f"\n\n## Priority Focus Areas\n"
+                f"Generate MORE detailed and in-depth questions for these domains: "
+                f"{', '.join(priority_domains)}. "
+                f"For other domains, still generate questions but at standard depth."
+            )
+
+        # Compliance concerns section
+        concerns_section = ""
+        if compliance_concerns:
+            concerns_section = (
+                f"\n\n## Specific Compliance Concerns\n"
+                f"The organization has flagged these concerns: {compliance_concerns}\n"
+                f"Incorporate targeted questions that address these specific gaps "
+                f"within relevant controls."
+            )
+
+        # Controls to skip
+        skip_section = ""
+        if controls_to_skip:
+            skip_section = (
+                f"\n\n## Controls to De-emphasize\n"
+                f"Reduce coverage for: {controls_to_skip}. "
+                f"Generate only 1 basic question for these controls."
+            )
+
+        return f"""You are a Senior ISMS Compliance Consultant & Auditor.
+
+Goal: Generate targeted, actionable compliance assessment questions specific to the organization's context, industry, and regulatory landscape.
+
+Backstory: You have 15+ years of experience conducting compliance audits for financial institutions across Southeast Asia, specializing in {' and '.join(frameworks) if frameworks else 'BNM RMIT and ISO 27001:2022'}. You understand that generic questionnaires produce generic results — the best assessments are tailored to the organization's specific risks, maturity, and operational context.
+
+## Project Context
+Organization: {org_name} ({industry})
+Frameworks: {', '.join(frameworks) if frameworks else 'Not specified'}
+Business Context: {biz_summary or 'Not available'}
+ISMS Scope: {scope_stmt or 'Not specified'}
+Documents Uploaded: {len(doc_names)} ({', '.join(doc_names[:10]) if doc_names else 'none'})
+Existing Findings: {findings_summary}
+
+## Framework Controls
+{controls_text}
+
+## Assessment Criteria
+Maturity Level: {maturity_level.replace('_', ' ').title()}
+Question Depth: {q_count}
+Complexity Guidance: {maturity_guidance}{priority_section}{concerns_section}{skip_section}
+
+## Instructions
+Generate questions for EVERY control in the selected frameworks. Output ONLY a JSON array with this exact schema (no prose, no markdown fences, no explanation):
+
+[
+  {{
+    "control_id": "A.5.1",
+    "control_title": "Policies for information security",
+    "framework": "ISO 27001:2022",
+    "questions": [
+      {{
+        "id": "q-<unique-id>",
+        "question": "The assessment question text",
+        "category": "policy_existence|implementation|monitoring|effectiveness|documentation",
+        "priority": "high|medium|low",
+        "expected_evidence": "What evidence the assessor should look for",
+        "guidance_notes": "Hints for the assessor on evaluating the answer"
+      }}
+    ]
+  }}
+]
+
+Generate {q_count} depending on the criteria above. Ensure questions are specific to {org_name}'s context, not generic boilerplate."""
+
+    @staticmethod
+    def _build_criteria_summary(
+        *,
+        maturity_level: str,
+        question_depth: str,
+        priority_domains: list[str],
+        compliance_concerns: str | None,
+        controls_to_skip: str | None,
+    ) -> str:
+        """Build a human-readable criteria summary from structured inputs."""
+        maturity_labels = {
+            "first_time_audit": "First-time audit",
+            "recurring_assessment": "Recurring assessment",
+            "mature_isms": "Mature ISMS",
+        }
+        depth_labels = {
+            "high_level_overview": "High-level overview (2 Q/control)",
+            "balanced": "Balanced (3 Q/control)",
+            "detailed_technical": "Detailed technical (4-5 Q/control)",
+        }
+
+        parts = [
+            f"Maturity: {maturity_labels.get(maturity_level, maturity_level)}",
+            f"Depth: {depth_labels.get(question_depth, question_depth)}",
+        ]
+        if priority_domains:
+            parts.append(f"Priority domains: {', '.join(priority_domains)}")
+        if compliance_concerns:
+            parts.append(f"Concerns: {compliance_concerns}")
+        if controls_to_skip:
+            parts.append(f"De-emphasized: {controls_to_skip}")
+
+        return "; ".join(parts)
+
+    @staticmethod
+    def _filter_controls(
+        controls: list[dict], priority_domains: list[str]
+    ) -> list[dict]:
+        """Filter controls to only those matching the given priority domains.
+
+        ISO 27001 matching:
+          - "A.7 Physical Controls" → prefix "A.7" matches control identifiers
+          - "Clauses 4-10 (Management)" → matches single-digit identifiers 4–10
+
+        BNM RMIT matching:
+          - Substring containment between domain label and section_title
+            (handles label mismatches like "Risk Management" ↔ "Technology Risk Management")
+        """
+        import re as _re
+
+        iso_prefixes: list[str] = []
+        include_management_clauses = False
+        bnm_labels: list[str] = []
+
+        for domain in priority_domains:
+            # Check for ISO Annex A prefix pattern like "A.5", "A.7"
+            m = _re.match(r"^(A\.\d+)", domain)
+            if m:
+                iso_prefixes.append(m.group(1))
+            elif "clauses 4-10" in domain.lower() or "clauses 4–10" in domain.lower():
+                include_management_clauses = True
+            else:
+                # Treat as BNM RMIT domain label
+                bnm_labels.append(domain.lower())
+
+        def _matches(ctrl: dict) -> bool:
+            fw = ctrl.get("framework", "")
+
+            if fw == "ISO 27001:2022":
+                ctrl_domain = ctrl.get("domain", "")
+                # Annex A prefix match
+                if iso_prefixes and ctrl_domain in iso_prefixes:
+                    return True
+                # Management clauses (identifiers like "4", "5", ... "10")
+                if include_management_clauses and ctrl_domain.isdigit():
+                    num = int(ctrl_domain)
+                    if 4 <= num <= 10:
+                        return True
+                return False
+
+            if fw == "BNM RMIT":
+                section = ctrl.get("section_title", "").lower()
+                for label in bnm_labels:
+                    # Bidirectional substring: "risk management" in
+                    # "technology risk management" OR vice versa
+                    if label in section or section in label:
+                        return True
+                return False
+
+            return False
+
+        return [c for c in controls if _matches(c)]
+
+    # ------------------------------------------------------------------
+    # Claude API interaction
+    # ------------------------------------------------------------------
+
+    @retry(
+        retry=retry_if_exception_type(
+            (anthropic.RateLimitError, anthropic.APITimeoutError)
+        ),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    async def _call_agent(
+        self, session: QuestionnaireSession
+    ) -> QuestionnaireResponse:
+        """Call Claude and handle tool_use vs end_turn."""
+        response = await self._client.messages.create(
+            model=self._model,
+            max_tokens=MAX_TOKENS,
+            system=session.system_prompt,
+            messages=session.messages,
+            tools=TOOLS,
+        )
+
+        # Append assistant response to conversation history
+        session.messages.append(
+            {"role": "assistant", "content": response.content}
+        )
+
+        # Check if Claude wants to use a tool
+        if response.stop_reason == "tool_use":
+            tool_block = next(
+                (b for b in response.content if b.type == "tool_use"), None
+            )
+            if tool_block:
+                session.pending_tool_use_id = tool_block.id
+
+                return AgentQuestion(
+                    session_id=session.session_id,
+                    question=tool_block.input.get("question", ""),
+                    context=tool_block.input.get("context"),
+                    options=tool_block.input.get("options"),
+                )
+
+        # If it's not a tool use, check if it contains JSON questions
+        text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                text += block.text
+        
+        if "[" in text and "]" in text and "control_id" in text:
+            # end_turn — agent is done, extract generated questions
+            return await self._handle_completion(session, response)
+        
+        # Fallback: if it's just text, treat it as a question to the user 
+        # but without tool metadata (manual fallback)
+        return AgentQuestion(
+            session_id=session.session_id,
+            question=text.strip() or "I need more information to generate the questions. Could you please clarify your requirements?",
+            context="The agent provided a text response instead of using a tool or generating JSON."
+        )
+
+    async def _handle_completion(
+        self,
+        session: QuestionnaireSession,
+        response: anthropic.types.Message,
+        criteria_summary_override: str | None = None,
+    ) -> QuestionnaireComplete:
+        """Parse final response and persist results."""
+        elapsed_ms = int(time.time() * 1000) - session.started_at_ms
+        session.status = "completed"
+
+        # Extract text from response
+        text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                text += block.text
+
+        controls = self._parse_questions(text, session.session_id)
+        total_questions = sum(len(c.questions) for c in controls)
+
+        # Use override (wizard flow) or extract from conversation (chat flow)
+        criteria_summary = (
+            criteria_summary_override
+            if criteria_summary_override is not None
+            else self._extract_criteria_summary(session)
+        )
+
+        # Persist to Supabase
+        await self._persist_results(
+            session, controls, total_questions, elapsed_ms, criteria_summary
+        )
+
+        return QuestionnaireComplete(
+            session_id=session.session_id,
+            controls=controls,
+            total_controls=len(controls),
+            total_questions=total_questions,
+            generation_time_ms=elapsed_ms,
+            criteria_summary=criteria_summary,
+        )
+
+    # ------------------------------------------------------------------
+    # Parsing
+    # ------------------------------------------------------------------
+
+    def _parse_questions(
+        self, text: str, session_id: str
+    ) -> list[ControlQuestions]:
+        """Extract JSON questions array from Claude's final response."""
+        # Try to find JSON array in the response
+        json_str = self._extract_json_array(text)
+        if not json_str:
+            logger.error(
+                f"Session {session_id}: Could not extract JSON from response"
+            )
+            return []
+
+        try:
+            raw = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"Session {session_id}: JSON parse error: {e}")
+            return []
+
+        controls = []
+        for item in raw:
+            questions = []
+            for q in item.get("questions", []):
+                questions.append(
+                    GeneratedQuestion(
+                        id=q.get("id", f"q-{uuid.uuid4().hex[:8]}"),
+                        question=q.get("question", ""),
+                        category=q.get("category", "general"),
+                        priority=q.get("priority", "medium"),
+                        expected_evidence=q.get("expected_evidence"),
+                        guidance_notes=q.get("guidance_notes"),
+                    )
+                )
+            controls.append(
+                ControlQuestions(
+                    control_id=item.get("control_id", ""),
+                    control_title=item.get("control_title", ""),
+                    framework=item.get("framework", ""),
+                    questions=questions,
+                )
+            )
+
+        return controls
+
+    @staticmethod
+    def _extract_json_array(text: str) -> Optional[str]:
+        """Find the outermost JSON array in a text blob."""
+        # Clean up the text - remove common issues
+        text = text.strip()
+        
+        # Look for ```json ... ``` fenced block first
+        import re
+
+        # More robust regex for JSON blocks
+        fence_match = re.search(
+            r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text, re.IGNORECASE
+        )
+        if fence_match:
+            return fence_match.group(1)
+
+        # Fallback: find first [ and matching ]
+        start = text.find("[")
+        if start == -1:
+            return None
+
+        # Try to find the last ] to be as inclusive as possible
+        end = text.rfind("]")
+        if end == -1 or end < start:
+            return None
+            
+        # If we have a lot of text, try to find matching brackets specifically
+        # to avoid capturing too much if there are multiple arrays
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "[":
+                depth += 1
+            elif text[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+
+        # If we didn't find a matching depth but have a start and end,
+        # return everything between them as a last resort (might be truncated)
+        return text[start : end + 1]
+
+    def _extract_criteria_summary(self, session: QuestionnaireSession) -> str:
+        """Build a summary of the user's stated criteria from the conversation."""
+        user_answers = []
+        for msg in session.messages:
+            if msg["role"] != "user":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if content.startswith("I'd like to generate"):
+                    continue
+                user_answers.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        user_answers.append(block.get("content", ""))
+
+        if not user_answers:
+            return "No specific criteria provided"
+
+        return "; ".join(user_answers)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    async def _persist_results(
+        self,
+        session: QuestionnaireSession,
+        controls: list[ControlQuestions],
+        total_questions: int,
+        elapsed_ms: int,
+        criteria_summary: str,
+    ) -> None:
+        """Store completed questionnaire session to Supabase."""
+        try:
+            from app.db.supabase import get_async_supabase_client_async
+
+            sb = await get_async_supabase_client_async()
+
+            # Serialize controls for JSONB
+            controls_json = [c.model_dump() for c in controls]
+
+            # Serialize conversation (strip non-serializable content blocks)
+            conversation = []
+            for msg in session.messages:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Convert Anthropic content blocks to dicts
+                    serialized = []
+                    for block in content:
+                        if hasattr(block, "model_dump"):
+                            serialized.append(block.model_dump())
+                        elif isinstance(block, dict):
+                            serialized.append(block)
+                        else:
+                            serialized.append(str(block))
+                    conversation.append(
+                        {"role": msg["role"], "content": serialized}
+                    )
+                else:
+                    conversation.append(msg)
+
+            row = {
+                "id": session.session_id,
+                "project_id": session.project_id,
+                "client_id": session.client_id,
+                "user_id": session.user_id,
+                "status": "completed",
+                "agent_criteria": {"summary": criteria_summary},
+                "generated_questions": controls_json,
+                "conversation_history": conversation,
+                "model_used": self._model,
+                "total_controls": len(controls),
+                "total_questions": total_questions,
+                "generation_time_ms": elapsed_ms,
+                "completed_at": datetime.utcnow().isoformat(),
+                "created_by": session.user_id,
+            }
+            if session.assessment_id:
+                row["assessment_id"] = session.assessment_id
+
+            await sb.table("questionnaire_sessions").insert(row).execute()
+
+            logger.info(
+                f"Session {session.session_id}: persisted {total_questions} "
+                f"questions across {len(controls)} controls"
+            )
+        except Exception as e:
+            logger.error(
+                f"Session {session.session_id}: failed to persist results: {e}"
+            )
