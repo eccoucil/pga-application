@@ -208,6 +208,13 @@ class QuestionnaireAgent:
         session_id = str(uuid.uuid4())
         started_at = int(time.time() * 1000)
 
+        # Return cached result if a completed session already exists
+        if assessment_id:
+            existing = await self._get_existing_session(assessment_id)
+            if existing:
+                logger.info(f"Returning cached questionnaire for assessment {assessment_id}")
+                return existing
+
         context = await self._fetch_project_context(project_id)
         client_id = context.get("client_id", "")
 
@@ -290,10 +297,10 @@ class QuestionnaireAgent:
         for i, batch in enumerate(batches):
             logger.info(f"Processing batch {i+1}/{len(batches)} ({len(batch)} controls)")
             
-            # Format this batch's controls
+            # Format this batch's controls (include framework so LLM assigns it correctly)
             batch_controls_text = ""
             for c in batch:
-                batch_controls_text += f"- **{c['id']}**: {c['title']} — {c['desc'][:200]}\n"
+                batch_controls_text += f"- **{c['id']}** [{c['framework']}]: {c['title']} — {c['desc'][:200]}\n"
 
             # Build a specialized prompt for this batch
             batch_system_prompt = self._build_batch_system_prompt(
@@ -730,9 +737,9 @@ Existing Findings: {findings_summary}
 ```json
 [
   {{
-    "control_id": "A.5.1",
-    "control_title": "Policies for information security",
-    "framework": "ISO 27001:2022",
+    "control_id": "Control ID from the list",
+    "control_title": "Control title from the list",
+    "framework": "The framework this control belongs to (e.g. ISO 27001:2022 or BNM RMIT)",
     "questions": [
       {{
         "id": "q-<unique-id>",
@@ -746,6 +753,8 @@ Existing Findings: {findings_summary}
   }}
 ]
 ```
+
+IMPORTANT: Set the "framework" field to match the actual framework each control belongs to (e.g. "BNM RMIT" for BNM controls, "ISO 27001:2022" for ISO controls).
 
 Generate 2-5 questions per control depending on the user's depth preference. Ensure questions are specific to {org_name}'s context, not generic boilerplate."""
 
@@ -891,9 +900,9 @@ Generate questions for EVERY control in the selected frameworks. Output ONLY a J
 
 [
   {{
-    "control_id": "A.5.1",
-    "control_title": "Policies for information security",
-    "framework": "ISO 27001:2022",
+    "control_id": "Control ID from the list",
+    "control_title": "Control title from the list",
+    "framework": "The framework this control belongs to (e.g. ISO 27001:2022 or BNM RMIT)",
     "questions": [
       {{
         "id": "q-<unique-id>",
@@ -906,6 +915,8 @@ Generate questions for EVERY control in the selected frameworks. Output ONLY a J
     ]
   }}
 ]
+
+IMPORTANT: Set the "framework" field to match the actual framework each control belongs to (e.g. "BNM RMIT" for BNM controls, "ISO 27001:2022" for ISO controls).
 
 Generate {q_count} depending on the criteria above. Ensure questions are specific to {org_name}'s context, not generic boilerplate."""
 
@@ -1216,6 +1227,39 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
+
+    async def _get_existing_session(self, assessment_id: str) -> QuestionnaireComplete | None:
+        """Return a cached QuestionnaireComplete if a completed session exists for this assessment."""
+        try:
+            from app.db.supabase import get_async_supabase_client_async
+
+            sb = await get_async_supabase_client_async()
+            result = (
+                await sb.table("questionnaire_sessions")
+                .select("id, generated_questions, total_controls, total_questions, generation_time_ms, agent_criteria")
+                .eq("assessment_id", assessment_id)
+                .eq("status", "completed")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            if not result.data:
+                return None
+
+            row = result.data[0]
+            controls = [ControlQuestions(**c) for c in row["generated_questions"]]
+            return QuestionnaireComplete(
+                session_id=row["id"],
+                controls=controls,
+                total_controls=row["total_controls"],
+                total_questions=row["total_questions"],
+                generation_time_ms=row["generation_time_ms"],
+                criteria_summary=row.get("agent_criteria", {}).get("summary", ""),
+            )
+        except Exception as e:
+            logger.warning(f"Cache lookup failed for assessment {assessment_id}: {e}")
+            return None
 
     async def _persist_results(
         self,
