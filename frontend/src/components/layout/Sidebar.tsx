@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { LayoutDashboard, Users, Briefcase, Settings, Sun, Moon, ChevronDown, ShieldCheck, FolderKanban, BookOpen, ScrollText } from "lucide-react"
+import { LayoutDashboard, Users, Briefcase, Settings, Sun, Moon, ChevronDown, ShieldCheck, FolderKanban, BookOpen, ScrollText, Landmark } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useClient } from "@/contexts/ClientContext"
 import { useProject } from "@/contexts/ProjectContext"
@@ -38,6 +38,15 @@ export function Sidebar() {
             icon: ScrollText,
             label: "Management Clauses",
             href: `/clients/${selectedClient.id}/projects/${selectedProject.id}/management-clauses`,
+          },
+        ]
+      : []),
+    ...(selectedClient && selectedProject?.framework?.includes("BNM RMIT")
+      ? [
+          {
+            icon: Landmark,
+            label: "BNM RMIT",
+            href: `/clients/${selectedClient.id}/projects/${selectedProject.id}/bnm-rmit`,
           },
         ]
       : []),

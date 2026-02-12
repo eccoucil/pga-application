@@ -11,6 +11,7 @@ router = APIRouter(prefix="/framework-docs", tags=["framework-docs"])
 DOCS_DIR = Path(__file__).resolve().parents[3] / "docs" / "framework"
 ANNEX_A_PATH = DOCS_DIR / "iso27001-2022-annex-a-controls.md"
 MGMT_CLAUSES_PATH = DOCS_DIR / "iso27001-2022-management-clauses.md"
+BNM_RMIT_PATH = DOCS_DIR / "bnm-rmit-policy-requirements.md"
 
 
 # ---------- Response models ----------
@@ -240,3 +241,124 @@ async def update_management_clause(clause_id: str, body: UpdateClauseBody):
     new_lines = lines[:start_idx] + ["", body.content, ""] + lines[end_idx:]
     MGMT_CLAUSES_PATH.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     return {"status": "updated", "clause_id": clause_id}
+
+
+# ---------- BNM RMIT parsing ----------
+
+
+class BnmRmitRequirement(BaseModel):
+    reference_id: str
+    requirement_type: str
+    content: str
+    notes: str | None = None
+
+
+class BnmRmitSection(BaseModel):
+    section_id: str
+    title: str
+    subsection_title: str | None = None
+    requirement_count: int
+    requirements: list[BnmRmitRequirement]
+
+
+class BnmRmitResponse(BaseModel):
+    sections: list[BnmRmitSection]
+
+
+_BNM_SECTION_RE = re.compile(r"^## (\d+)\.\s+(.+)$")
+_BNM_SUBSECTION_RE = re.compile(r"^### (.+)$")
+_BNM_REQ_RE = re.compile(r"^\*\*([SG])\s+(\d+\.\d+)\*\*\s*(.*)")
+
+
+def _parse_bnm_rmit(text: str) -> list[BnmRmitSection]:
+    groups: list[BnmRmitSection] = []
+    current_section_id: str | None = None
+    current_section_title: str | None = None
+    current_subsection_title: str | None = None
+    current_reqs: list[BnmRmitRequirement] = []
+    current_req: dict | None = None
+
+    def flush_req():
+        nonlocal current_req
+        if current_req is not None:
+            content = "\n".join(current_req["content_lines"]).strip()
+            notes = "\n".join(current_req["note_lines"]).strip() or None
+            current_reqs.append(
+                BnmRmitRequirement(
+                    reference_id=current_req["reference_id"],
+                    requirement_type=current_req["requirement_type"],
+                    content=content,
+                    notes=notes,
+                )
+            )
+            current_req = None
+
+    def flush_group():
+        nonlocal current_reqs
+        flush_req()
+        if current_reqs and current_section_id is not None:
+            groups.append(
+                BnmRmitSection(
+                    section_id=current_section_id,
+                    title=current_section_title or "",
+                    subsection_title=current_subsection_title,
+                    requirement_count=len(current_reqs),
+                    requirements=list(current_reqs),
+                )
+            )
+            current_reqs = []
+
+    for line in text.splitlines():
+        if line.strip() == "---":
+            continue
+
+        sec_match = _BNM_SECTION_RE.match(line)
+        if sec_match:
+            flush_group()
+            current_section_id = sec_match.group(1)
+            current_section_title = sec_match.group(2).strip()
+            current_subsection_title = None
+            continue
+
+        if line.startswith("## "):
+            continue
+
+        sub_match = _BNM_SUBSECTION_RE.match(line)
+        if sub_match and current_section_id is not None:
+            flush_group()
+            current_subsection_title = sub_match.group(1).strip()
+            continue
+
+        req_match = _BNM_REQ_RE.match(line)
+        if req_match:
+            flush_req()
+            type_char = req_match.group(1)
+            ref_num = req_match.group(2)
+            rest = req_match.group(3).strip()
+            current_req = {
+                "reference_id": f"{type_char} {ref_num}",
+                "requirement_type": "standard" if type_char == "S" else "guidance",
+                "content_lines": [rest] if rest else [],
+                "note_lines": [],
+            }
+            continue
+
+        if current_req is not None:
+            if line.startswith("> "):
+                current_req["note_lines"].append(line[2:])
+            elif line == ">":
+                current_req["note_lines"].append("")
+            else:
+                current_req["content_lines"].append(line)
+
+    flush_group()
+    return groups
+
+
+@router.get("/bnm-rmit", response_model=BnmRmitResponse)
+async def get_bnm_rmit():
+    """Return all BNM RMIT policy requirements parsed from the markdown reference file."""
+    if not BNM_RMIT_PATH.exists():
+        raise HTTPException(status_code=404, detail="BNM RMIT markdown file not found")
+    text = BNM_RMIT_PATH.read_text(encoding="utf-8")
+    return BnmRmitResponse(sections=_parse_bnm_rmit(text))
