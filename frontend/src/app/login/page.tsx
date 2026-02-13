@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import { useAuth } from "@/contexts/AuthContext"
 import { useToast } from "@/hooks/use-toast"
@@ -8,8 +8,14 @@ import { Loader2, Mail, Lock, Eye, EyeOff, ShieldCheck } from "lucide-react"
 
 export default function LoginPage() {
   const router = useRouter()
-  const { signIn, signUp } = useAuth()
+  const { user, loading, signIn, signUp } = useAuth()
   const { toast } = useToast()
+
+  useEffect(() => {
+    if (!loading && user) {
+      router.push("/clients")
+    }
+  }, [user, loading, router])
 
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
