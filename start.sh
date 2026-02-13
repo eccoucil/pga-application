@@ -2,6 +2,10 @@
 
 # PGA Application Startup Script
 # Starts both frontend (Next.js) and backend (FastAPI) servers
+#
+# Alternative: run the full stack in Docker:
+#   docker compose up --build          (production)
+#   docker compose --profile dev up    (development with hot reload)
 
 set -e
 
@@ -35,16 +39,6 @@ trap cleanup SIGINT SIGTERM
 echo -e "${GREEN}Starting PGA Application${NC}"
 echo "================================"
 
-# Start Docker services (Qdrant + Neo4j) - optional
-echo -e "${YELLOW}Starting Docker services (Qdrant, Neo4j)...${NC}"
-cd "$BACKEND_DIR"
-if docker-compose up -d 2>/dev/null; then
-    echo -e "${GREEN}Docker services started${NC}"
-    sleep 3
-else
-    echo -e "${RED}Docker not available - skipping (Qdrant/Neo4j won't be available)${NC}"
-fi
-
 # Start backend
 echo -e "${YELLOW}Starting backend on http://localhost:8001${NC}"
 cd "$BACKEND_DIR"
@@ -66,8 +60,6 @@ echo -e "${GREEN}PGA Application is running!${NC}"
 echo -e "  Frontend: ${GREEN}http://localhost:3001${NC}"
 echo -e "  Backend:  ${GREEN}http://localhost:8001${NC}"
 echo -e "  API Docs: ${GREEN}http://localhost:8001/docs${NC}"
-echo -e "  Qdrant:   ${GREEN}http://localhost:16333/dashboard${NC}"
-echo -e "  Neo4j:    ${GREEN}http://localhost:17474${NC}"
 echo -e "${GREEN}================================${NC}"
 echo -e "${YELLOW}Press Ctrl+C to stop all services${NC}"
 echo ""

@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.env
+.env*.local
+coverage/
+.git/
+.gitignore
+Dockerfile
+*.md
+__mocks__/
+jest.config.ts
+jest.setup.ts
