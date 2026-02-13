@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState, useRef, FormEvent, ChangeEvent } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useEffect, useState, useRef, type FormEvent } from "react";
+import { useParams, useRouter, useSearchParams, usePathname } from "next/navigation";
 import { DashboardLayout } from "@/components/layout/DashboardLayout";
 import { useClient } from "@/contexts/ClientContext";
 import { useProject } from "@/contexts/ProjectContext";
@@ -19,23 +19,22 @@ import {
   DialogTitle,
   DialogDescription,
 } from "@/components/ui/dialog";
-import type { AssessmentResponse } from "@/types/assessment";
+import type {
+  AssessmentResponse,
+  AssessmentRecord,
+  AssessmentDetail,
+} from "@/types/assessment";
+import { AssessmentHistoryTable } from "@/components/assessment/AssessmentHistoryTable";
+import { AssessmentFormCard } from "@/components/assessment/AssessmentFormCard";
+import { FindingsContent } from "@/components/assessment/FindingsContent";
+import { QuestionnaireContent } from "@/components/assessment/QuestionnaireContent";
 import {
   Loader2,
   ArrowLeft,
-  Upload,
-  X,
-  FileText,
-  AlertCircle,
-  Plus,
-  Check,
-  ChevronDown,
-  Info,
   Calendar,
   Briefcase,
   FileCheck,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 interface FormData {
   organizationName: string;
@@ -66,42 +65,6 @@ const industryTypes = [
   "Retail",
   "Government",
   "Other",
-];
-
-
-const defaultDepartments = [
-  "Information Technology",
-  "Human Resources",
-  "Finance",
-  "Operations",
-  "Legal & Compliance",
-  "Risk Management",
-  "Internal Audit",
-  "Security",
-  "Customer Service",
-  "Marketing",
-  "Sales",
-  "Research & Development",
-];
-
-const allowedFileTypes = [
-  "application/pdf",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/msword",
-  "text/plain",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.ms-excel",
-  "text/csv",
-];
-
-const allowedExtensions = [
-  ".pdf",
-  ".docx",
-  ".doc",
-  ".txt",
-  ".xlsx",
-  ".xls",
-  ".csv",
 ];
 
 const STORAGE_KEY_PREFIX = "assessment-form-";
@@ -160,10 +123,13 @@ function setStoredForm(projectId: string, data: StoredFormData): void {
   }
 }
 
+type ViewMode = "loading" | "table" | "view" | "edit" | "new";
 
 export default function AssessmentPage() {
   const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const pathname = usePathname();
   const { user, loading: authLoading } = useAuth();
   const { selectedClient, setSelectedClient } = useClient();
   const { selectedProject, setSelectedProject } = useProject();
@@ -173,8 +139,17 @@ export default function AssessmentPage() {
   const [loading, setLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [showLoadingModal, setShowLoadingModal] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const hasHydratedRef = useRef(false);
+
+  // View mode state machine
+  const [viewMode, setViewMode] = useState<ViewMode>("loading");
+  const [assessments, setAssessments] = useState<AssessmentRecord[]>([]);
+  const [selectedAssessmentId, setSelectedAssessmentId] = useState<
+    string | null
+  >(null);
+  const [activeStep, setActiveStep] = useState<1 | 2 | 3>(1);
+  const [findingsData, setFindingsData] = useState<AssessmentResponse | null>(
+    null,
+  );
 
   const [formData, setFormData] = useState<FormData>({
     organizationName: "",
@@ -187,14 +162,103 @@ export default function AssessmentPage() {
   });
 
   const [errors, setErrors] = useState<FormErrors>({});
-  const [departments, setDepartments] = useState<string[]>(defaultDepartments);
-  const [showDepartmentDropdown, setShowDepartmentDropdown] = useState(false);
-  const [newDepartment, setNewDepartment] = useState("");
-  const [isDragging, setIsDragging] = useState(false);
   const [steps, setSteps] = useState<AssessmentStep[]>([
     { number: 1, title: "Scope", status: "current" },
-    { number: 2, title: "Questionnaire", status: "upcoming" },
+    { number: 2, title: "Findings", status: "upcoming" },
+    { number: 3, title: "Questionnaire", status: "upcoming" },
   ]);
+
+  // ---------- URL sync ----------
+
+  const urlAssessmentId = searchParams.get("assessment");
+  const urlStep = searchParams.get("step");
+
+  function updateUrl(assessmentId: string | null, step: number | null) {
+    const params = new URLSearchParams();
+    if (assessmentId) params.set("assessment", assessmentId);
+    if (step) params.set("step", String(step));
+    const query = params.toString();
+    router.replace(`${pathname}${query ? `?${query}` : ""}`, { scroll: false });
+  }
+
+  // ---------- Data fetching ----------
+
+  /** Try to hydrate form fields from the /findings endpoint (legacy Neo4j data). */
+  const hydrateFromFindings = async (session: { access_token: string } | null) => {
+    try {
+      const apiUrl =
+        process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+      const res = await fetch(
+        `${apiUrl}/assessment/findings?client_id=${encodeURIComponent(clientId)}&project_id=${encodeURIComponent(projectId)}`,
+        {
+          headers: {
+            ...(session?.access_token
+              ? { Authorization: `Bearer ${session.access_token}` }
+              : {}),
+          },
+        },
+      );
+      if (!res.ok) return;
+      const data: AssessmentResponse = await res.json();
+      const ctx = data.organization_context;
+      const validIndustry = industryTypes.includes(ctx.industry_type)
+        ? ctx.industry_type
+        : "";
+      setFormData((prev) => ({
+        ...prev,
+        organizationName: ctx.organization_name ?? "",
+        natureOfBusiness: "",
+        industryType: validIndustry,
+        webDomain: ctx.web_domain ?? "",
+        department: ctx.department ?? "",
+        scopeStatementISMS: ctx.scope_statement_preview ?? "",
+        documents: prev.documents,
+      }));
+    } catch {
+      // leave form as-is
+    }
+  };
+
+  const fetchAssessments = async (): Promise<AssessmentRecord[]> => {
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const apiUrl =
+        process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+      const res = await fetch(
+        `${apiUrl}/assessment/list?project_id=${encodeURIComponent(projectId)}&client_id=${encodeURIComponent(clientId)}`,
+        {
+          headers: {
+            ...(session?.access_token
+              ? { Authorization: `Bearer ${session.access_token}` }
+              : {}),
+          },
+        },
+      );
+      if (!res.ok) {
+        // List endpoint failed — try hydrating from findings (legacy data)
+        const { data: { session: s } } = await supabase.auth.getSession();
+        await hydrateFromFindings(s);
+        setViewMode("new");
+        return [];
+      }
+      const data = await res.json();
+      const list: AssessmentRecord[] = data.assessments || [];
+      setAssessments(list);
+      if (list.length > 0) {
+        setViewMode("table");
+      } else {
+        // No rows in assessments table — try hydrating from findings (legacy Neo4j data)
+        await hydrateFromFindings(session);
+        setViewMode("new");
+      }
+      return list;
+    } catch {
+      setViewMode("new");
+      return [];
+    }
+  };
 
   // Fetch client and project data if not in context
   useEffect(() => {
@@ -234,86 +298,24 @@ export default function AssessmentPage() {
     fetchData();
   }, [clientId, projectId, selectedClient, selectedProject, authLoading, user]);
 
-  // Hydrate form from sessionStorage (back from findings) or from API (existing assessment)
+  // Fetch assessment list once loading finishes, then restore from URL params
   useEffect(() => {
-    if (
-      typeof window === "undefined" ||
-      !projectId ||
-      !clientId ||
-      loading ||
-      authLoading ||
-      !user
-    )
-      return;
-    if (hasHydratedRef.current) return;
-    hasHydratedRef.current = true;
-
-    const stored = getStoredForm(projectId);
-    const hasStored =
-      stored &&
-      (stored.organizationName?.trim() ||
-        stored.natureOfBusiness?.trim() ||
-        stored.industryType?.trim() ||
-        stored.department?.trim() ||
-        stored.scopeStatementISMS?.trim() ||
-        stored.webDomain?.trim());
-
-    if (hasStored && stored) {
-      setFormData((prev) => ({
-        ...prev,
-        ...stored,
-        documents: prev.documents,
-      }));
-      return;
-    }
-
-    const prefetchFromApi = async () => {
-      try {
-        const {
-          data: { session },
-        } = await supabase.auth.getSession();
-        const apiUrl =
-          process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
-        const res = await fetch(
-          `${apiUrl}/assessment/findings?client_id=${encodeURIComponent(clientId)}&project_id=${encodeURIComponent(projectId)}`,
-          {
-            method: "GET",
-            headers: {
-              "Content-Type": "application/json",
-              ...(session?.access_token
-                ? { Authorization: `Bearer ${session.access_token}` }
-                : {}),
-            },
-          },
-        );
-        if (!res.ok) return;
-        const data: AssessmentResponse = await res.json();
-        const ctx = data.organization_context;
-        const crawledIndustry = ctx.industry_type ?? "";
-        const validIndustry = industryTypes.includes(crawledIndustry)
-          ? crawledIndustry
-          : "";
-        setFormData((prev) => ({
-          ...prev,
-          organizationName: ctx.organization_name ?? "",
-          natureOfBusiness: "",
-          industryType: validIndustry,
-          webDomain: ctx.web_domain ?? "",
-          department: ctx.department ?? "",
-          scopeStatementISMS: ctx.scope_statement_preview ?? "",
-          documents: prev.documents,
-        }));
-      } catch {
-        // leave form as-is
+    if (loading || authLoading || !user || !projectId || !clientId) return;
+    const init = async () => {
+      const list = await fetchAssessments();
+      // Restore navigation state from URL if an assessment ID is present
+      if (urlAssessmentId && list.some((a) => a.id === urlAssessmentId)) {
+        const rawStep = Number(urlStep);
+        const step: 1 | 2 | 3 = rawStep === 2 ? 2 : rawStep === 3 ? 3 : 1;
+        await handleSelectAssessment(urlAssessmentId, step);
       }
     };
-
-    prefetchFromApi();
-  }, [projectId, clientId, loading, authLoading, user]);
+    init();
+  }, [loading, authLoading, user, projectId, clientId]);
 
   // Persist serializable form fields to sessionStorage (debounced)
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId || viewMode === "loading" || viewMode === "table") return;
     const stored: StoredFormData = {
       organizationName: formData.organizationName,
       natureOfBusiness: formData.natureOfBusiness,
@@ -337,6 +339,7 @@ export default function AssessmentPage() {
     return () => clearTimeout(t);
   }, [
     projectId,
+    viewMode,
     formData.organizationName,
     formData.natureOfBusiness,
     formData.industryType,
@@ -345,156 +348,179 @@ export default function AssessmentPage() {
     formData.scopeStatementISMS,
   ]);
 
-  const validateForm = (): boolean => {
-    const newErrors: FormErrors = {};
-
-    if (!formData.organizationName.trim()) {
-      newErrors.organizationName = "Organization name is required";
-    } else if (formData.organizationName.trim().length < 2) {
-      newErrors.organizationName =
-        "Organization name must be at least 2 characters";
-    }
-
-    if (!formData.natureOfBusiness.trim()) {
-      newErrors.natureOfBusiness = "Nature of business is required";
-    } else if (formData.natureOfBusiness.trim().length < 10) {
-      newErrors.natureOfBusiness =
-        "Please provide a more detailed description (at least 10 characters)";
-    }
-
-    if (!formData.industryType) {
-      newErrors.industryType = "Please select an industry type";
-    }
-
-    // Web domain is optional, but validate format if provided
-    if (formData.webDomain.trim()) {
-      const domainRegex =
-        /^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
-      if (!domainRegex.test(formData.webDomain.trim())) {
-        newErrors.webDomain = "Please enter a valid domain (e.g., example.com)";
+  // Update stepper based on view mode, active step, and findings data
+  useEffect(() => {
+    if (viewMode === "view") {
+      if (activeStep === 3 && findingsData) {
+        setSteps([
+          { number: 1, title: "Scope", status: "completed" },
+          { number: 2, title: "Findings", status: "completed" },
+          { number: 3, title: "Questionnaire", status: "current" },
+        ]);
+      } else if (activeStep === 2 && findingsData) {
+        setSteps([
+          { number: 1, title: "Scope", status: "completed" },
+          { number: 2, title: "Findings", status: "current" },
+          { number: 3, title: "Questionnaire", status: "upcoming" },
+        ]);
+      } else {
+        setSteps([
+          { number: 1, title: "Scope", status: "current" },
+          {
+            number: 2,
+            title: "Findings",
+            status: findingsData ? "completed" : "upcoming",
+          },
+          { number: 3, title: "Questionnaire", status: "upcoming" },
+        ]);
       }
+    } else {
+      setSteps([
+        { number: 1, title: "Scope", status: "current" },
+        { number: 2, title: "Findings", status: "upcoming" },
+        { number: 3, title: "Questionnaire", status: "upcoming" },
+      ]);
     }
+  }, [viewMode, activeStep, findingsData]);
 
-    if (!formData.department) {
-      newErrors.department = "Please select or add a department";
-    }
+  // ---------- Handlers ----------
 
-    if (!formData.scopeStatementISMS.trim()) {
-      newErrors.scopeStatementISMS = "Scope Statement ISMS is required";
-    } else if (formData.scopeStatementISMS.trim().length < 10) {
-      newErrors.scopeStatementISMS =
-        "Please provide a more detailed scope statement (at least 10 characters)";
-    }
-
-    // Documents are now optional - no validation needed
-
-    setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
-  };
-
-  const handleInputChange = (
-    e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>,
+  const handleSelectAssessment = async (
+    id: string,
+    targetStep: 1 | 2 | 3 = 1,
   ) => {
-    const { name, value } = e.target;
-    setFormData((prev) => ({ ...prev, [name]: value }));
-    if (errors[name as keyof FormErrors]) {
-      setErrors((prev) => ({ ...prev, [name]: undefined }));
-    }
-  };
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const apiUrl =
+        process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+      const res = await fetch(`${apiUrl}/assessment/detail/${id}`, {
+        headers: {
+          ...(session?.access_token
+            ? { Authorization: `Bearer ${session.access_token}` }
+            : {}),
+        },
+      });
+      if (!res.ok) throw new Error("Failed to fetch assessment");
+      const detail: AssessmentDetail = await res.json();
+      setSelectedAssessmentId(id);
+      setFormData({
+        organizationName: detail.organization_name,
+        natureOfBusiness: detail.nature_of_business,
+        industryType: detail.industry_type,
+        webDomain: detail.web_domain || "",
+        department: detail.department,
+        scopeStatementISMS: detail.scope_statement_isms,
+        documents: [],
+      });
+      setErrors({});
+      setViewMode("view");
 
-  const handleDepartmentSelect = (dept: string) => {
-    setFormData((prev) => ({ ...prev, department: dept }));
-    setShowDepartmentDropdown(false);
-    if (errors.department) {
-      setErrors((prev) => ({ ...prev, department: undefined }));
-    }
-  };
-
-  const handleAddDepartment = () => {
-    if (newDepartment.trim() && !departments.includes(newDepartment.trim())) {
-      const trimmedDept = newDepartment.trim();
-      setDepartments((prev) => [...prev, trimmedDept]);
-      setFormData((prev) => ({ ...prev, department: trimmedDept }));
-      setNewDepartment("");
-      setShowDepartmentDropdown(false);
-      if (errors.department) {
-        setErrors((prev) => ({ ...prev, department: undefined }));
+      // Parse response_snapshot if available
+      let hasFindings = false;
+      if (detail.response_snapshot) {
+        setFindingsData(
+          detail.response_snapshot as unknown as AssessmentResponse,
+        );
+        hasFindings = true;
+      } else {
+        // Fallback: fetch from /assessment/findings endpoint
+        try {
+          const findingsRes = await fetch(
+            `${apiUrl}/assessment/findings?client_id=${encodeURIComponent(clientId)}&project_id=${encodeURIComponent(projectId)}`,
+            {
+              headers: {
+                ...(session?.access_token
+                  ? { Authorization: `Bearer ${session.access_token}` }
+                  : {}),
+              },
+            },
+          );
+          if (findingsRes.ok) {
+            const findingsJson: AssessmentResponse =
+              await findingsRes.json();
+            setFindingsData(findingsJson);
+            hasFindings = true;
+          } else {
+            setFindingsData(null);
+          }
+        } catch {
+          setFindingsData(null);
+        }
       }
-    }
-  };
 
-  const validateFile = (file: File): boolean => {
-    const extension = "." + file.name.split(".").pop()?.toLowerCase();
-    return (
-      allowedFileTypes.includes(file.type) ||
-      allowedExtensions.includes(extension)
-    );
-  };
-
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    addFiles(files);
-  };
-
-  const addFiles = (files: File[]) => {
-    const validFiles = files.filter(validateFile);
-    const invalidCount = files.length - validFiles.length;
-
-    if (invalidCount > 0) {
+      // Fall back to step 1 if requesting findings/questionnaire but no data
+      const resolvedStep = (targetStep > 1 && !hasFindings) ? 1 : targetStep;
+      setActiveStep(resolvedStep);
+      updateUrl(id, resolvedStep);
+    } catch {
       toast({
-        title: "Invalid files",
-        description: `${invalidCount} file(s) were not added. Only PDF, DOCX, TXT, XLSX, and CSV files are allowed.`,
+        title: "Error",
+        description: "Failed to load assessment details.",
         variant: "destructive",
       });
     }
+  };
 
-    if (validFiles.length > 0) {
-      setFormData((prev) => ({
-        ...prev,
-        documents: [...prev.documents, ...validFiles],
-      }));
-      if (errors.documents) {
-        setErrors((prev) => ({ ...prev, documents: undefined }));
+  const handleNewAssessment = async () => {
+    // Auto-fill from latest assessment if one exists
+    if (assessments.length > 0) {
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        const apiUrl =
+          process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001";
+        const res = await fetch(
+          `${apiUrl}/assessment/detail/${assessments[0].id}`,
+          {
+            headers: {
+              ...(session?.access_token
+                ? { Authorization: `Bearer ${session.access_token}` }
+                : {}),
+            },
+          },
+        );
+        if (res.ok) {
+          const detail: AssessmentDetail = await res.json();
+          setFormData({
+            organizationName: detail.organization_name,
+            natureOfBusiness: detail.nature_of_business,
+            industryType: detail.industry_type,
+            webDomain: detail.web_domain || "",
+            department: detail.department,
+            scopeStatementISMS: detail.scope_statement_isms,
+            documents: [],
+          });
+          setErrors({});
+          setSelectedAssessmentId(null);
+          setViewMode("new");
+          updateUrl(null, null);
+          return;
+        }
+      } catch {
+        /* fall through */
       }
     }
-  };
-
-  const handleRemoveFile = (index: number) => {
-    setFormData((prev) => ({
-      ...prev,
-      documents: prev.documents.filter((_, i) => i !== index),
-    }));
-  };
-
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    const files = Array.from(e.dataTransfer.files);
-    addFiles(files);
+    // Fall back to client name
+    setFormData({
+      organizationName: selectedClient?.name || "",
+      natureOfBusiness: "",
+      industryType: "",
+      webDomain: "",
+      department: "",
+      scopeStatementISMS: "",
+      documents: [],
+    });
+    setErrors({});
+    setSelectedAssessmentId(null);
+    setViewMode("new");
+    updateUrl(null, null);
   };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-
-    // Validation removed for stepper navigation
-    // if (!validateForm()) {
-    //   toast({
-    //     title: "Validation Error",
-    //     description: "Please fill in all required fields correctly.",
-    //     variant: "destructive",
-    //   })
-    //   return
-    // }
 
     setIsSubmitting(true);
     setShowLoadingModal(true);
@@ -542,11 +568,12 @@ export default function AssessmentPage() {
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(
-          errorData.detail || `Failed to submit assessment: ${response.status}`,
+          errorData.detail ||
+            `Failed to submit assessment: ${response.status}`,
         );
       }
 
-      const result: AssessmentResponse = await response.json();
+      await response.json();
 
       setShowLoadingModal(false);
 
@@ -554,6 +581,9 @@ export default function AssessmentPage() {
         title: "Success",
         description: "Assessment form submitted successfully.",
       });
+
+      // Refetch list and go to table view
+      await fetchAssessments();
     } catch (error) {
       setShowLoadingModal(false);
       toast({
@@ -569,17 +599,7 @@ export default function AssessmentPage() {
     }
   };
 
-  const getFileIcon = (fileName: string) => {
-    return <FileText className="h-5 w-5 text-slate-400" />;
-  };
-
-  const formatFileSize = (bytes: number) => {
-    if (bytes === 0) return "0 Bytes";
-    const k = 1024;
-    const sizes = ["Bytes", "KB", "MB", "GB"];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
-  };
+  // ---------- Early returns ----------
 
   if (authLoading || loading) {
     return (
@@ -594,6 +614,8 @@ export default function AssessmentPage() {
   if (!user) {
     return null;
   }
+
+  // ---------- Helpers ----------
 
   const formatDate = (dateString: string | null | undefined) => {
     if (!dateString) return "Not set";
@@ -617,9 +639,17 @@ export default function AssessmentPage() {
     }
   };
 
+  // ---------- Render ----------
+
   return (
     <DashboardLayout>
-      <div className="max-w-4xl mx-auto pb-10">
+      <div
+        className={`${
+          viewMode === "view" && (activeStep === 2 || activeStep === 3)
+            ? "max-w-6xl"
+            : "max-w-4xl"
+        } mx-auto pb-10 transition-all duration-300`}
+      >
         {/* Back Button - Top Left */}
         <button
           onClick={() => router.push(`/clients/${clientId}/projects`)}
@@ -669,14 +699,16 @@ export default function AssessmentPage() {
                         Compliance Frameworks
                       </p>
                       <div className="flex flex-wrap gap-2">
-                        {selectedProject.framework.map((fw, idx) => (
-                          <span
-                            key={idx}
-                            className="px-2 py-1 bg-purple-500/10 text-purple-300 text-xs rounded border border-purple-500/20"
-                          >
-                            {fw}
-                          </span>
-                        ))}
+                        {selectedProject.framework.map(
+                          (fw: string, idx: number) => (
+                            <span
+                              key={idx}
+                              className="px-2 py-1 bg-purple-500/10 text-purple-300 text-xs rounded border border-purple-500/20"
+                            >
+                              {fw}
+                            </span>
+                          ),
+                        )}
                       </div>
                     </div>
                   </div>
@@ -708,396 +740,105 @@ export default function AssessmentPage() {
         {/* Divider */}
         <div className="h-px bg-gradient-to-r from-transparent via-white/10 to-transparent mb-8"></div>
 
-        {/* Stepper */}
-        <AssessmentStepper steps={steps} />
-
-        {/* Form Card */}
-        <div className="bg-[#0f1016]/60 backdrop-blur-md border border-white/10 rounded-2xl overflow-hidden shadow-2xl relative group">
-          <div className="absolute -inset-0.5 bg-gradient-to-br from-purple-600/20 to-indigo-600/20 rounded-2xl blur-xl opacity-0 group-hover:opacity-100 transition duration-500"></div>
-
-          {/* Card Header */}
-          <div className="relative p-6 text-white">
-            <div className="relative">
-              <h2 className="text-xl font-bold">
-                Organization Assessment Form
-              </h2>
-              <p className="text-purple-100 text-sm mt-1 opacity-90">
-                Please fill in all the required information for the compliance
-                assessment
-              </p>
-            </div>
+        {/* View mode: loading */}
+        {viewMode === "loading" && (
+          <div className="flex justify-center items-center min-h-[200px]">
+            <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
           </div>
+        )}
 
-          {/* Form Content */}
-          <form onSubmit={handleSubmit} className="relative p-8 space-y-8">
-            {/* Organization Name */}
-            <div className="space-y-2">
-              <label
-                htmlFor="organizationName"
-                className="text-xs font-medium text-slate-400 uppercase tracking-wider"
-              >
-                Organization Name <span className="text-rose-500">*</span>
-              </label>
-              <input
-                type="text"
-                id="organizationName"
-                name="organizationName"
-                value={formData.organizationName}
-                onChange={handleInputChange}
-                className={cn(
-                  "w-full bg-black/40 border rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-600 focus:outline-none focus:ring-1 transition-all",
-                  errors.organizationName
-                    ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/50"
-                    : "border-white/10 focus:border-purple-500/50 focus:ring-purple-500/50",
-                )}
-                placeholder="Enter organization name"
-              />
-              {errors.organizationName && (
-                <div className="flex items-center gap-2 text-red-400 text-xs">
-                  <AlertCircle className="w-3 h-3" />
-                  <span>{errors.organizationName}</span>
-                </div>
-              )}
-            </div>
+        {/* View mode: table */}
+        {viewMode === "table" && (
+          <AssessmentHistoryTable
+            assessments={assessments}
+            onSelect={handleSelectAssessment}
+            onNew={handleNewAssessment}
+            onViewFindings={(id) => handleSelectAssessment(id, 2)}
+          />
+        )}
 
-            {/* Nature of Business */}
-            <div className="space-y-2">
-              <label
-                htmlFor="natureOfBusiness"
-                className="text-xs font-medium text-slate-400 uppercase tracking-wider"
-              >
-                Nature of Business <span className="text-rose-500">*</span>
-              </label>
-              <textarea
-                id="natureOfBusiness"
-                name="natureOfBusiness"
-                value={formData.natureOfBusiness}
-                onChange={handleInputChange}
-                rows={4}
-                className={cn(
-                  "w-full bg-black/40 border rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-600 focus:outline-none focus:ring-1 transition-all resize-none",
-                  errors.natureOfBusiness
-                    ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/50"
-                    : "border-white/10 focus:border-purple-500/50 focus:ring-purple-500/50",
-                )}
-                placeholder="Describe the nature of your business, products, services, and operations..."
-              />
-              {errors.natureOfBusiness && (
-                <div className="flex items-center gap-2 text-red-400 text-xs">
-                  <AlertCircle className="w-3 h-3" />
-                  <span>{errors.natureOfBusiness}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Industry Type */}
-            <div className="space-y-2">
-              <label
-                htmlFor="industryType"
-                className="text-xs font-medium text-slate-400 uppercase tracking-wider"
-              >
-                Industry Type <span className="text-rose-500">*</span>
-              </label>
-              <div className="relative">
-                <select
-                  id="industryType"
-                  name="industryType"
-                  value={formData.industryType}
-                  onChange={handleInputChange}
-                  className={cn(
-                    "w-full bg-black/40 border rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:ring-1 transition-all appearance-none cursor-pointer",
-                    errors.industryType
-                      ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/50"
-                      : "border-white/10 focus:border-purple-500/50 focus:ring-purple-500/50",
-                  )}
-                >
-                  <option value="" disabled>
-                    Select industry type
-                  </option>
-                  {industryTypes.map((industry) => (
-                    <option key={industry} value={industry}>
-                      {industry}
-                    </option>
-                  ))}
-                </select>
-                <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
-              </div>
-              {errors.industryType && (
-                <div className="flex items-center gap-2 text-red-400 text-xs">
-                  <AlertCircle className="w-3 h-3" />
-                  <span>{errors.industryType}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Web Domain */}
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-                  Web Domain for Crawling
-                </label>
-                <span className="text-xs text-slate-500 bg-white/5 px-2 py-0.5 rounded border border-white/5">
-                  Optional
-                </span>
-              </div>
-              <input
-                type="text"
-                id="webDomain"
-                name="webDomain"
-                value={formData.webDomain}
-                onChange={handleInputChange}
-                className={cn(
-                  "w-full bg-black/40 border rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-600 focus:outline-none focus:ring-1 transition-all",
-                  errors.webDomain
-                    ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/50"
-                    : "border-white/10 focus:border-purple-500/50 focus:ring-purple-500/50",
-                )}
-                placeholder="example.com"
-              />
-              <p className="text-xs text-slate-500 flex items-center gap-1">
-                <Info className="w-3 h-3" />
-                Enter the domain to crawl for policy documents and compliance
-                information
-              </p>
-              {errors.webDomain && (
-                <div className="flex items-center gap-2 text-red-400 text-xs">
-                  <AlertCircle className="w-3 h-3" />
-                  <span>{errors.webDomain}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Department - Creatable Dropdown */}
-            <div className="space-y-2">
-              <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-                Department <span className="text-rose-500">*</span>
-              </label>
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() =>
-                    setShowDepartmentDropdown(!showDepartmentDropdown)
+        {/* View mode: view / edit / new */}
+        {(viewMode === "view" ||
+          viewMode === "edit" ||
+          viewMode === "new") && (
+          <>
+            {/* Stepper */}
+            <AssessmentStepper
+              steps={steps}
+              onStepClick={(stepNumber) => {
+                if (viewMode === "view") {
+                  if (stepNumber === 1) {
+                    setActiveStep(1);
+                    updateUrl(selectedAssessmentId, 1);
                   }
-                  className={cn(
-                    "w-full bg-black/40 border rounded-lg px-3 py-2.5 text-left flex items-center justify-between text-white text-sm focus:outline-none focus:ring-1 transition-all",
-                    errors.department
-                      ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/50"
-                      : "border-white/10 focus:border-purple-500/50 focus:ring-purple-500/50",
-                    !formData.department && "text-slate-500",
-                  )}
-                >
-                  <span>
-                    {formData.department || "Select or add department"}
-                  </span>
-                  <ChevronDown
-                    className={cn(
-                      "w-4 h-4 text-slate-500 transition-transform",
-                      showDepartmentDropdown && "rotate-180",
-                    )}
-                  />
-                </button>
+                  if (stepNumber === 2 && findingsData) {
+                    setActiveStep(2);
+                    updateUrl(selectedAssessmentId, 2);
+                  }
+                  if (stepNumber === 3 && findingsData) {
+                    setActiveStep(3);
+                    updateUrl(selectedAssessmentId, 3);
+                  }
+                }
+              }}
+            />
 
-                {showDepartmentDropdown && (
-                  <div className="absolute z-[200] w-full mt-1 bg-[#0f1016] border border-white/10 rounded-lg shadow-xl max-h-60 overflow-y-auto">
-                    {/* Add new department input */}
-                    <div className="p-2 border-b border-white/10">
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="text"
-                          value={newDepartment}
-                          onChange={(e) => setNewDepartment(e.target.value)}
-                          placeholder="Add new department..."
-                          className="flex-1 bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50"
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              e.preventDefault();
-                              handleAddDepartment();
-                            }
-                          }}
-                        />
-                        <button
-                          type="button"
-                          onClick={handleAddDepartment}
-                          disabled={!newDepartment.trim()}
-                          className="p-2 bg-purple-600 text-white rounded-lg hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                        >
-                          <Plus className="h-4 w-4" />
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Department options */}
-                    {departments.map((dept) => (
-                      <button
-                        key={dept}
-                        type="button"
-                        onClick={() => handleDepartmentSelect(dept)}
-                        className={cn(
-                          "w-full px-4 py-2 text-left text-sm hover:bg-white/5 flex items-center justify-between text-slate-300",
-                          formData.department === dept &&
-                            "bg-purple-500/10 text-purple-300",
-                        )}
-                      >
-                        <span>{dept}</span>
-                        {formData.department === dept && (
-                          <Check className="h-4 w-4" />
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              {errors.department && (
-                <div className="flex items-center gap-2 text-red-400 text-xs">
-                  <AlertCircle className="w-3 h-3" />
-                  <span>{errors.department}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Scope Statement ISMS */}
-            <div className="space-y-2">
-              <label
-                htmlFor="scopeStatementISMS"
-                className="text-xs font-medium text-slate-400 uppercase tracking-wider"
-              >
-                Scope Statement ISMS <span className="text-rose-500">*</span>
-              </label>
-              <textarea
-                id="scopeStatementISMS"
-                name="scopeStatementISMS"
-                value={formData.scopeStatementISMS}
-                onChange={handleInputChange}
-                rows={6}
-                className={cn(
-                  "w-full bg-black/40 border rounded-lg px-3 py-2.5 text-white text-sm placeholder:text-slate-600 focus:outline-none focus:ring-1 transition-all resize-none",
-                  errors.scopeStatementISMS
-                    ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/50"
-                    : "border-white/10 focus:border-purple-500/50 focus:ring-purple-500/50",
-                )}
-                placeholder="Enter the scope statement for your Information Security Management System (ISMS)..."
+            {/* Step 1: Scope Form (shown when activeStep === 1 or when editing/new) */}
+            {(viewMode !== "view" || activeStep === 1) && (
+              <AssessmentFormCard
+                formData={formData}
+                formErrors={errors}
+                readOnly={viewMode === "view"}
+                onFieldChange={(name, value) => {
+                  setFormData((prev) => ({ ...prev, [name]: value }));
+                  if (errors[name as keyof typeof errors]) {
+                    setErrors((prev) => ({ ...prev, [name]: undefined }));
+                  }
+                }}
+                onDocumentsChange={(files) => {
+                  setFormData((prev) => ({
+                    ...prev,
+                    documents: [...prev.documents, ...files],
+                  }));
+                }}
+                onRemoveDocument={(index) => {
+                  setFormData((prev) => ({
+                    ...prev,
+                    documents: prev.documents.filter((_, i) => i !== index),
+                  }));
+                }}
+                onSubmit={handleSubmit}
+                onCancel={() => {
+                  if (assessments.length > 0) {
+                    setSelectedAssessmentId(null);
+                    setViewMode("table");
+                    updateUrl(null, null);
+                  } else {
+                    router.push(`/clients/${clientId}/projects`);
+                  }
+                }}
+                onEdit={() => setViewMode("edit")}
+                isSubmitting={isSubmitting}
+                onProceedToFindings={
+                  findingsData ? () => { setActiveStep(2); updateUrl(selectedAssessmentId, 2); } : undefined
+                }
               />
-              {errors.scopeStatementISMS && (
-                <div className="flex items-center gap-2 text-red-400 text-xs">
-                  <AlertCircle className="w-3 h-3" />
-                  <span>{errors.scopeStatementISMS}</span>
-                </div>
-              )}
-            </div>
+            )}
 
-            {/* File Upload */}
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-                  Upload Documents
-                </label>
-                <span className="text-xs text-slate-500 bg-white/5 px-2 py-0.5 rounded border border-white/5">
-                  Optional
-                </span>
-              </div>
-              <div
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDrop}
-                onClick={() => fileInputRef.current?.click()}
-                className={cn(
-                  "border-2 border-dashed rounded-xl p-8 transition-all hover:border-purple-500/50 hover:bg-purple-500/5 cursor-pointer group/upload",
-                  isDragging
-                    ? "border-purple-500/50 bg-purple-500/10"
-                    : errors.documents
-                      ? "border-red-500/50 bg-red-500/5"
-                      : "border-white/10",
-                )}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  multiple
-                  accept=".pdf,.docx,.doc,.txt,.xlsx,.xls,.csv"
-                  onChange={handleFileChange}
-                  className="hidden"
-                />
-                <div className="flex flex-col items-center justify-center text-center">
-                  <div className="w-12 h-12 rounded-full bg-purple-500/10 flex items-center justify-center text-purple-400 mb-4 group-hover/upload:scale-110 transition-transform">
-                    <Upload className="w-6 h-6" />
-                  </div>
-                  <h3 className="text-sm font-medium text-white mb-1">
-                    Click to upload or drag and drop
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    PDF, DOCX, TXT, XLSX, or CSV (max 10MB each)
-                  </p>
-                </div>
-              </div>
+            {/* Step 2: Findings (shown when activeStep === 2 in view mode) */}
+            {viewMode === "view" && activeStep === 2 && findingsData && (
+              <FindingsContent
+                data={findingsData}
+                onProceedToQuestionnaire={() => { setActiveStep(3); updateUrl(selectedAssessmentId, 3); }}
+              />
+            )}
 
-              {/* File list */}
-              {formData.documents.length > 0 && (
-                <div className="mt-4 space-y-2">
-                  {formData.documents.map((file, index) => (
-                    <div
-                      key={index}
-                      className="flex items-center justify-between p-3 bg-black/40 border border-white/10 rounded-lg"
-                    >
-                      <div className="flex items-center gap-3">
-                        {getFileIcon(file.name)}
-                        <div>
-                          <p className="text-sm font-medium text-white truncate max-w-xs">
-                            {file.name}
-                          </p>
-                          <p className="text-xs text-slate-500">
-                            {formatFileSize(file.size)}
-                          </p>
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveFile(index)}
-                        className="p-1 text-slate-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {errors.documents && (
-                <div className="flex items-center gap-2 text-red-400 text-xs">
-                  <AlertCircle className="w-3 h-3" />
-                  <span>{errors.documents}</span>
-                </div>
-              )}
-            </div>
-
-            {/* Footer Actions */}
-            <div className="flex justify-end gap-3 pt-6 border-t border-white/5 mt-2">
-              <button
-                type="button"
-                onClick={() => router.push(`/clients/${clientId}/projects`)}
-                className="px-4 py-2 text-sm font-medium text-slate-400 hover:text-white transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                type="submit"
-                disabled={isSubmitting}
-                className={cn(
-                  "px-6 py-2 text-sm font-medium bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-lg shadow-lg shadow-purple-900/20 transition-all",
-                  isSubmitting && "opacity-50 cursor-not-allowed",
-                )}
-              >
-                {isSubmitting ? (
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    <span>Submitting...</span>
-                  </span>
-                ) : (
-                  "Submit Assessment"
-                )}
-              </button>
-            </div>
-          </form>
-        </div>
+            {/* Step 3: Questionnaire (shown when activeStep === 3 in view mode) */}
+            {viewMode === "view" && activeStep === 3 && findingsData && (
+              <QuestionnaireContent projectId={projectId} frameworks={selectedProject?.framework ?? []} assessmentId={selectedAssessmentId ?? undefined} />
+            )}
+          </>
+        )}
       </div>
 
       {/* Loading Modal - centered in viewport via Dialog flex layout */}

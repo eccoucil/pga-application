@@ -58,7 +58,7 @@ class AssessmentOrchestrator:
     2. Validates and structures data
     3. Processes documents with LlamaExtract in parallel (if available)
     4. Runs web crawl in parallel (if web_domain provided)
-    5. Stores extractions in Neo4j and Qdrant
+    5. Stores extractions in Supabase pgvector
     6. Tracks assessment state
 
     NO LLM calls - pure coordination.
@@ -165,141 +165,87 @@ class AssessmentOrchestrator:
         self, request: AssessmentRequest
     ) -> OrganizationContextSummary:
         """
-        Create Organization node with full assessment context and return actual Neo4j data.
+        Create organization context from form data for knowledge graph.
 
-        This creates the Organization with all context fields AND the separate
-        context nodes (BusinessContext, Industry, Department, ISMSScope) linked
-        via relationships. Returns actual stored data from Neo4j with node IDs.
+        Build organization context from form data (no external DB needed).
+
+        Generates UUID-based node references for the knowledge graph
+        visualization. The graph still renders identically — nodes come from
+        assessment form data, not from Neo4j.
 
         Args:
             request: Assessment request containing organization info
 
         Returns:
-            OrganizationContextSummary with actual Neo4j node references
+            OrganizationContextSummary with context node references
         """
         org_info = request.organization_info
         context_nodes: list[Neo4jNodeReference] = []
         context_nodes_created: list[str] = []
-        created = False
-        organization_id: Optional[str] = None
-        industry_sector: Optional[str] = None
 
-        try:
-            from app.models.knowledge_graph import OrganizationNode
-            from app.services.neo4j_service import get_neo4j_service
-
-            neo4j = get_neo4j_service()
-
-            # Build Organization node with all assessment context
-            organization = OrganizationNode(
-                client_id=request.client_id,
-                project_id=request.project_id,
+        # Generate context nodes from form data (no Neo4j needed)
+        organization_id = str(uuid.uuid4())
+        context_nodes.append(
+            Neo4jNodeReference(
+                node_id=organization_id,
+                node_type="Organization",
                 name=org_info.organization_name,
-                web_domain=org_info.web_domain,
-                nature_of_business=org_info.nature_of_business,
-                industry_type=org_info.industry_type.value
-                if org_info.industry_type
-                else None,
-                department=org_info.department,
-                scope_statement_isms=org_info.scope_statement_isms,
             )
+        )
+        context_nodes_created.append("Organization")
 
-            # Create Organization with context nodes (new architecture)
-            # This writes to both properties (backward compat) AND creates linked nodes
-            created_org = await neo4j.create_organization(
-                organization, create_context_nodes=True
-            )
-            created = True
-            organization_id = created_org.id
-
-            # Add Organization node reference
+        if org_info.industry_type:
             context_nodes.append(
                 Neo4jNodeReference(
-                    node_id=organization_id,
-                    node_type="Organization",
-                    name=org_info.organization_name,
+                    node_id=str(uuid.uuid4()),
+                    node_type="Industry",
+                    name=org_info.industry_type.value,
                 )
             )
-            context_nodes_created.append("Organization")
+            context_nodes_created.append("Industry")
 
-            # Query back the full context from Neo4j to get actual node IDs
-            stored_context = await neo4j.get_organization_context(
-                client_id=request.client_id,
-                project_id=request.project_id,
-            )
-
-            if stored_context:
-                # Extract industry sector from stored data
-                industry_sector = stored_context.get("industry_sector")
-
-                # Get the context node IDs that were created
-                # We need to query these separately since get_organization_context
-                # doesn't return node IDs
-                context_node_ids = await self._get_context_node_ids(
-                    neo4j=neo4j,
-                    organization_id=organization_id,
+        if org_info.department:
+            context_nodes.append(
+                Neo4jNodeReference(
+                    node_id=str(uuid.uuid4()),
+                    node_type="Department",
+                    name=org_info.department,
                 )
-
-                # Add Industry node reference if created
-                if org_info.industry_type and context_node_ids.get("industry_id"):
-                    context_nodes.append(
-                        Neo4jNodeReference(
-                            node_id=context_node_ids["industry_id"],
-                            node_type="Industry",
-                            name=org_info.industry_type.value,
-                        )
-                    )
-                    context_nodes_created.append("Industry")
-
-                # Add Department node reference if created
-                if org_info.department and context_node_ids.get("department_id"):
-                    context_nodes.append(
-                        Neo4jNodeReference(
-                            node_id=context_node_ids["department_id"],
-                            node_type="Department",
-                            name=org_info.department,
-                        )
-                    )
-                    context_nodes_created.append("Department")
-
-                # Add ISMSScope node reference if created
-                if org_info.scope_statement_isms and context_node_ids.get(
-                    "isms_scope_id"
-                ):
-                    context_nodes.append(
-                        Neo4jNodeReference(
-                            node_id=context_node_ids["isms_scope_id"],
-                            node_type="ISMSScope",
-                            name=None,
-                        )
-                    )
-                    context_nodes_created.append("ISMSScope")
-
-                # Add BusinessContext node reference if created
-                if org_info.nature_of_business and context_node_ids.get(
-                    "business_context_id"
-                ):
-                    context_nodes.append(
-                        Neo4jNodeReference(
-                            node_id=context_node_ids["business_context_id"],
-                            node_type="BusinessContext",
-                            name=None,
-                        )
-                    )
-                    context_nodes_created.append("BusinessContext")
-
-            logger.info(
-                f"Created Organization with context: client={request.client_id}, "
-                f"project={request.project_id}, org={org_info.organization_name}, "
-                f"nodes={context_nodes_created}"
             )
+            context_nodes_created.append("Department")
 
-        except Exception as e:
-            # Log but don't fail - document processing can still create basic node
-            logger.warning(f"Failed to create Organization with context: {e}")
+        if org_info.scope_statement_isms:
+            context_nodes.append(
+                Neo4jNodeReference(
+                    node_id=str(uuid.uuid4()),
+                    node_type="ISMSScope",
+                    name=None,
+                )
+            )
+            context_nodes_created.append("ISMSScope")
+
+        if org_info.nature_of_business:
+            context_nodes.append(
+                Neo4jNodeReference(
+                    node_id=str(uuid.uuid4()),
+                    node_type="BusinessContext",
+                    name=None,
+                )
+            )
+            context_nodes_created.append("BusinessContext")
+
+        industry_sector = (
+            org_info.industry_type.value if org_info.industry_type else None
+        )
+
+        logger.info(
+            f"Built Organization context: client={request.client_id}, "
+            f"project={request.project_id}, org={org_info.organization_name}, "
+            f"nodes={context_nodes_created}"
+        )
 
         return OrganizationContextSummary(
-            created=created,
+            created=True,
             organization_id=organization_id,
             organization_name=org_info.organization_name,
             industry_type=org_info.industry_type.value
@@ -314,56 +260,6 @@ class AssessmentOrchestrator:
             context_nodes=context_nodes,
             context_nodes_created=context_nodes_created,
         )
-
-    async def _get_context_node_ids(
-        self,
-        neo4j: Any,
-        organization_id: str,
-    ) -> dict[str, str]:
-        """
-        Query Neo4j to get the element IDs of all context nodes linked to an Organization.
-
-        Args:
-            neo4j: Neo4j service instance
-            organization_id: The Organization node's element ID
-
-        Returns:
-            Dict mapping node type to element ID
-        """
-        result: dict[str, str] = {}
-
-        try:
-            query = """
-            MATCH (o:Organization) WHERE elementId(o) = $organization_id
-            OPTIONAL MATCH (o)-[:HAS_BUSINESS_CONTEXT]->(bc:BusinessContext)
-            OPTIONAL MATCH (o)-[:IN_INDUSTRY]->(i:Industry)
-            OPTIONAL MATCH (o)-[:HAS_DEPARTMENT]->(dept:Department)
-            OPTIONAL MATCH (o)-[:HAS_SCOPE]->(scope:ISMSScope)
-            RETURN
-                elementId(bc) as business_context_id,
-                elementId(i) as industry_id,
-                elementId(dept) as department_id,
-                elementId(scope) as isms_scope_id
-            """
-
-            async with neo4j._driver.session() as session:
-                query_result = await session.run(query, organization_id=organization_id)
-                record = await query_result.single()
-
-                if record:
-                    if record["business_context_id"]:
-                        result["business_context_id"] = record["business_context_id"]
-                    if record["industry_id"]:
-                        result["industry_id"] = record["industry_id"]
-                    if record["department_id"]:
-                        result["department_id"] = record["department_id"]
-                    if record["isms_scope_id"]:
-                        result["isms_scope_id"] = record["isms_scope_id"]
-
-        except Exception as e:
-            logger.warning(f"Failed to get context node IDs: {e}")
-
-        return result
 
     def _build_knowledge_graph(
         self,
@@ -639,7 +535,7 @@ class AssessmentOrchestrator:
                 confidence_score=row.get("confidence_score", 0.0),
                 processing_time_ms=0,  # Not applicable for cached results
                 errors=[],
-                # Neo4j graph data not included in cache (acceptable per plan)
+                # Graph data not included in cache (acceptable)
                 attack_surface=None,
                 graph_company=None,
                 graph_assets=[],
@@ -760,9 +656,8 @@ class AssessmentOrchestrator:
             if extraction_result and extraction_result.get("status") == "success":
                 extracted = extraction_result.get("extraction_result")
                 extracted_text = getattr(extracted, "text", None) if extracted else None
-                neo4j_node_id = extraction_result.get("neo4j_node_id")
 
-                if extracted_text and neo4j_node_id:
+                if extracted_text:
                     try:
                         policy_enrichment = await self._enrich_document_with_policies(
                             client_id=client_id,
@@ -770,7 +665,6 @@ class AssessmentOrchestrator:
                             organization_name=organization_name,
                             filename=filename,
                             text=extracted_text,
-                            neo4j_node_id=neo4j_node_id,
                         )
                     except Exception as enrich_err:
                         logger.warning(
@@ -801,7 +695,7 @@ class AssessmentOrchestrator:
             filename=filename,
             status=status,
             extracted_text_length=(
-                extraction_result.get("qdrant_chunks", 0) if extraction_result else 0
+                extraction_result.get("pgvector_chunks", 0) if extraction_result else 0
             ),
         )
 
@@ -948,7 +842,7 @@ class AssessmentOrchestrator:
         elif doc_results:
             next_step = "upload_more_docs"
         else:
-            next_step = "start_questionnaire"
+            next_step = "review_findings"
 
         return AssessmentSummary(
             headline=f"Assessment received for {request.organization_info.organization_name}",
@@ -979,7 +873,7 @@ class AssessmentOrchestrator:
             doc_results: Results from document processing
             web_crawl_result: Result from web crawl (if run)
             from_cache: Whether web crawl result was served from cache
-            org_context: Organization context summary from Neo4j creation
+            org_context: Organization context summary
             processing_time_ms: Total processing time in milliseconds
 
         Returns:
@@ -1102,7 +996,7 @@ class AssessmentOrchestrator:
         filename: str,
     ) -> dict:
         """
-        Extract structured data from document and store in Neo4j + Qdrant.
+        Extract structured data from document and store in pgvector.
 
         Links all data to Company entity via client_id.
 
@@ -1117,8 +1011,7 @@ class AssessmentOrchestrator:
             Dict with status and extraction details
         """
         from app.services.llama_extract_service import get_llama_extract_service
-        from app.services.neo4j_service import get_neo4j_service
-        from app.services.qdrant_service import get_qdrant_service
+        from app.services.supabase_vector_service import get_supabase_vector_service
 
         extract_service = get_llama_extract_service()
 
@@ -1138,24 +1031,8 @@ class AssessmentOrchestrator:
             extraction_result = await extract_service.infer_and_extract(document_path)
             extracted_data = extraction_result["data"]
 
-            # Store in Neo4j (linked to Company)
-            neo4j = get_neo4j_service()
-            node_id = await neo4j.create_extracted_document(
-                client_id=client_id,
-                project_id=project_id,
-                organization_name=organization_name,
-                document_id=filename,
-                extraction_type=extraction_result["schema"],
-                extracted_data=(
-                    extracted_data
-                    if isinstance(extracted_data, dict)
-                    else extracted_data.model_dump()
-                ),
-                source_filename=filename,
-            )
-
-            # Store in Qdrant for semantic search (linked to Company via client_id)
-            qdrant = get_qdrant_service()
+            # Store in pgvector for semantic search (linked to Company via client_id)
+            vector_svc = get_supabase_vector_service()
 
             # Flatten extracted data to searchable text fields
             searchable_fields = self._flatten_for_search(
@@ -1163,7 +1040,7 @@ class AssessmentOrchestrator:
                 if isinstance(extracted_data, dict)
                 else extracted_data.model_dump()
             )
-            chunk_ids = await qdrant.upsert_extracted_data(
+            chunk_ids = await vector_svc.upsert_extracted_data(
                 client_id=client_id,
                 project_id=project_id,
                 document_id=filename,
@@ -1172,13 +1049,12 @@ class AssessmentOrchestrator:
             )
 
             logger.info(
-                f"Extracted {filename}: neo4j={node_id}, qdrant_chunks={len(chunk_ids)}"
+                f"Extracted {filename}: pgvector_chunks={len(chunk_ids)}"
             )
 
             return {
                 "status": "success",
-                "neo4j_node_id": node_id,
-                "qdrant_chunks": len(chunk_ids),
+                "pgvector_chunks": len(chunk_ids),
                 "schema_type": extraction_result["schema"],
             }
 
@@ -1198,7 +1074,7 @@ class AssessmentOrchestrator:
         Fallback document extraction using Python-native libraries.
 
         Used when LlamaExtract (LLAMA_CLOUD_API_KEY) is not configured.
-        Extracts text via pypdf/python-docx/openpyxl, stores in Neo4j + Qdrant.
+        Extracts text via pypdf/python-docx/openpyxl, stores in pgvector.
 
         Args:
             client_id: Client UUID
@@ -1211,8 +1087,7 @@ class AssessmentOrchestrator:
             Dict with status and extraction details
         """
         from app.services.document_text_extractor import DocumentTextExtractor
-        from app.services.neo4j_service import get_neo4j_service
-        from app.services.qdrant_service import get_qdrant_service
+        from app.services.supabase_vector_service import get_supabase_vector_service
 
         try:
             extractor = DocumentTextExtractor()
@@ -1222,29 +1097,12 @@ class AssessmentOrchestrator:
                 logger.warning(f"Fallback extraction produced no text for {filename}")
                 return {"status": "error", "error": "No text extracted from document"}
 
-            # Store in Neo4j as ExtractedDocument
-            neo4j = get_neo4j_service()
-            node_id = await neo4j.create_extracted_document(
-                client_id=client_id,
-                project_id=project_id,
-                organization_name=organization_name,
-                document_id=filename,
-                extraction_type="fallback",
-                extracted_data={
-                    "title": extraction.title,
-                    "format": extraction.format,
-                    "page_count": extraction.page_count,
-                    "word_count": extraction.word_count,
-                },
-                source_filename=filename,
-            )
-
-            # Store text chunks in Qdrant for semantic search
-            qdrant = get_qdrant_service()
+            # Store text chunks in pgvector for semantic search
+            vector_svc = get_supabase_vector_service()
 
             # Split text into searchable chunks
             searchable_fields = self._split_text_to_fields(extraction.text, filename)
-            chunk_ids = await qdrant.upsert_extracted_data(
+            chunk_ids = await vector_svc.upsert_extracted_data(
                 client_id=client_id,
                 project_id=project_id,
                 document_id=filename,
@@ -1253,14 +1111,13 @@ class AssessmentOrchestrator:
             )
 
             logger.info(
-                f"Fallback extracted {filename}: neo4j={node_id}, "
-                f"qdrant_chunks={len(chunk_ids)}, words={extraction.word_count}"
+                f"Fallback extracted {filename}: "
+                f"pgvector_chunks={len(chunk_ids)}, words={extraction.word_count}"
             )
 
             return {
                 "status": "success",
-                "neo4j_node_id": node_id,
-                "qdrant_chunks": len(chunk_ids),
+                "pgvector_chunks": len(chunk_ids),
                 "schema_type": "fallback",
                 "extraction_result": extraction,
             }
@@ -1276,13 +1133,12 @@ class AssessmentOrchestrator:
         organization_name: str,
         filename: str,
         text: str,
-        neo4j_node_id: str,
     ) -> dict:
         """
-        Analyze document text for policy content and create graph nodes.
+        Analyze document text for policy content.
 
         Uses Claude to classify documents as policies and map to controls.
-        Creates Policy, Control, and relationship nodes in Neo4j.
+        Returns analysis results (no longer stores in Neo4j).
 
         Args:
             client_id: Client UUID
@@ -1290,13 +1146,11 @@ class AssessmentOrchestrator:
             organization_name: Organization name
             filename: Original filename
             text: Extracted document text
-            neo4j_node_id: Neo4j element ID of the ExtractedDocument node
 
         Returns:
             Dict with enrichment status and details
         """
         from app.services.document_analyzer import DocumentAnalyzer
-        from app.services.neo4j_service import get_neo4j_service
 
         try:
             analyzer = DocumentAnalyzer()
@@ -1315,118 +1169,30 @@ class AssessmentOrchestrator:
                     "confidence": analysis.confidence,
                 }
 
-            neo4j = get_neo4j_service()
-
-            # Get the Organization node for this project
-            org = await neo4j.get_organization(
-                project_id=project_id, client_id=client_id
-            )
-            organization_id = org.id if org else None
-
-            # Create Policy node
-            from app.models.knowledge_graph import (
-                ComplianceLevel,
-                ControlNode,
-                FrameworkType,
-                PolicyControlMapping,
-                PolicyNode,
-                PolicyType as KGPolicyType,
-            )
-
-            # Map analyzer policy_type to knowledge_graph PolicyType
-            policy_type_map = {
-                "information_security": KGPolicyType.SECURITY_POLICY,
-                "access_control": KGPolicyType.ACCESS_CONTROL,
-                "data_protection": KGPolicyType.DATA_PROTECTION,
-                "business_continuity": KGPolicyType.BUSINESS_CONTINUITY,
-                "incident_response": KGPolicyType.INCIDENT_RESPONSE,
-                "risk_management": KGPolicyType.RISK_MANAGEMENT,
-                "acceptable_use": KGPolicyType.ACCEPTABLE_USE,
-                "change_management": KGPolicyType.OTHER,
-                "physical_security": KGPolicyType.SECURITY_POLICY,
-                "human_resources": KGPolicyType.OTHER,
-                "compliance": KGPolicyType.SECURITY_POLICY,
-                "network_security": KGPolicyType.SECURITY_POLICY,
-                "cryptography": KGPolicyType.SECURITY_POLICY,
-                "supplier_management": KGPolicyType.VENDOR_MANAGEMENT,
-                "other": KGPolicyType.OTHER,
-            }
-
-            policy_type = policy_type_map.get(
-                analysis.policy_type or "", KGPolicyType.INFORMATION_SECURITY
-            )
-
-            policy = PolicyNode(
-                document_id=filename,
-                project_id=project_id,
-                title=analysis.title or filename,
-                policy_type=policy_type,
-                version=analysis.version,
-                chunk_count=0,
-            )
-
-            created_policy = await neo4j.create_policy(
-                policy, organization_id=organization_id
-            )
-            policy_id = created_policy.id
-
-            # Link ExtractedDocument to Policy
-            await neo4j.link_document_to_policy(
-                doc_id=neo4j_node_id, policy_id=policy_id
-            )
-
-            # Create Control nodes and link to Policy
-            controls_mapped = 0
+            # Collect control mappings from Claude analysis
+            controls_mapped = []
             for ctrl in analysis.controls_addressed:
-                try:
-                    framework = (
-                        FrameworkType.ISO_27001
-                        if ctrl.framework == "iso27001"
-                        else FrameworkType.BNM_RMIT
-                    )
-
-                    control_node = ControlNode(
-                        framework=framework,
-                        identifier=ctrl.identifier,
-                        title=ctrl.title,
-                    )
-                    created_control = await neo4j.create_control(control_node)
-
-                    # Map compliance level
-                    level_map = {
-                        "compliant": ComplianceLevel.COMPLIANT,
-                        "partially_compliant": ComplianceLevel.PARTIALLY_COMPLIANT,
-                        "non_compliant": ComplianceLevel.NON_COMPLIANT,
+                controls_mapped.append(
+                    {
+                        "framework": ctrl.framework,
+                        "identifier": ctrl.identifier,
+                        "title": ctrl.title,
+                        "compliance_level": ctrl.compliance_level,
+                        "evidence": ctrl.evidence,
+                        "gap": ctrl.gap,
                     }
-                    level = level_map.get(
-                        ctrl.compliance_level, ComplianceLevel.PARTIALLY_COMPLIANT
-                    )
-
-                    mapping = PolicyControlMapping(
-                        policy_id=policy_id,
-                        control_id=created_control.id,
-                        compliance_level=level,
-                        evidence=ctrl.evidence,
-                        gap_description=ctrl.gap,
-                    )
-                    await neo4j.link_policy_to_control(mapping)
-                    controls_mapped += 1
-
-                except Exception as ctrl_err:
-                    logger.warning(
-                        f"Failed to map control {ctrl.identifier}: {ctrl_err}"
-                    )
+                )
 
             logger.info(
                 f"Policy enrichment for {filename}: type={analysis.policy_type}, "
-                f"controls_mapped={controls_mapped}"
+                f"controls_mapped={len(controls_mapped)}"
             )
 
             return {
                 "policy_analysis": "success",
                 "policy_type": analysis.policy_type,
-                "policy_id": policy_id,
-                "controls_mapped": controls_mapped,
+                "controls_mapped": len(controls_mapped),
+                "control_details": controls_mapped,
                 "confidence": analysis.confidence,
             }
 
@@ -1446,7 +1212,7 @@ class AssessmentOrchestrator:
             chunk_size: Target characters per chunk
 
         Returns:
-            Dict of field_name -> text_value for Qdrant storage
+            Dict of field_name -> text_value for vector storage
         """
         fields = {}
         words = text.split()

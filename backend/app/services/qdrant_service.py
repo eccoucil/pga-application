@@ -59,6 +59,13 @@ class QdrantService:
                 # Create payload indexes for filtering
                 await self._create_payload_indexes()
 
+            # Diagnostic log for search attribute issue
+            has_search = hasattr(self._client, 'search')
+            client_type = type(self._client).__name__
+            logger.info(f"Qdrant client type: {client_type}, has 'search' attribute: {has_search}")
+            if not has_search:
+                logger.warning(f"Available attributes on {client_type}: {dir(self._client)}")
+
             self._collection_initialized = True
             logger.info("Qdrant collection initialized")
 
@@ -262,15 +269,34 @@ class QdrantService:
 
         # Execute search
         search_start = time.time()
-        results = await self._client.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=query_embedding,
-            query_filter=search_filter,
-            limit=request.limit,
-            offset=request.offset,
-            score_threshold=request.score_threshold,
-            with_payload=request.include_metadata,
-        )
+        try:
+            results = await self._client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_embedding,
+                query_filter=search_filter,
+                limit=request.limit,
+                offset=request.offset,
+                score_threshold=request.score_threshold,
+                with_payload=request.include_metadata,
+            )
+        except AttributeError:
+            # Fallback for some versions where it might be slightly different or for debugging
+            logger.error(f"AsyncQdrantClient search attribute error. Client type: {type(self._client)}")
+            # Try query_points as fallback if search is missing in some async versions
+            if hasattr(self._client, 'query_points'):
+                results = await self._client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    prefetch=[
+                        models.Prefetch(
+                            query=query_embedding, # Use query instead of vector
+                            limit=request.limit,
+                            filter=search_filter,
+                        )
+                    ]
+                )
+                results = results.points
+            else:
+                raise
         search_time = (time.time() - search_start) * 1000
 
         # Convert to response model
@@ -513,23 +539,49 @@ class QdrantService:
 
         query_embedding = await self._embedding_service.embed_text(query)
 
-        results = await self._client.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=query_embedding,
-            query_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="client_id",
-                        match=models.MatchValue(value=client_id),
-                    ),
-                    models.FieldCondition(
-                        key="doc_type",
-                        match=models.MatchValue(value="llama_extraction"),
-                    ),
-                ]
-            ),
-            limit=limit,
-        )
+        try:
+            results = await self._client.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_embedding,
+                query_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="client_id",
+                            match=models.MatchValue(value=client_id),
+                        ),
+                        models.FieldCondition(
+                            key="doc_type",
+                            match=models.MatchValue(value="llama_extraction"),
+                        ),
+                    ]
+                ),
+                limit=limit,
+            )
+        except AttributeError:
+            if hasattr(self._client, 'query_points'):
+                results = await self._client.query_points(
+                    collection_name=COLLECTION_NAME,
+                    prefetch=[
+                        models.Prefetch(
+                            query=query_embedding, # Use query instead of vector
+                            limit=limit,
+                            filter=models.Filter(
+                                must=[
+                                    models.FieldCondition(
+                                        key="client_id",
+                                        match=models.MatchValue(value=client_id),
+                                    ),
+                                    models.FieldCondition(
+                                        key="doc_type",
+                                        match=models.MatchValue(value="llama_extraction"),
+                                    ),
+                                ]
+                            ),
+                        )
+                    ]
+                ).points
+            else:
+                raise
 
         return [{"id": str(r.id), "score": r.score, **r.payload} for r in results]
 

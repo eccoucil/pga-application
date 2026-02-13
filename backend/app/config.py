@@ -13,15 +13,6 @@ class Settings(BaseSettings):
     supabase_key: str
     supabase_service_key: str
 
-    # Neo4j
-    neo4j_uri: str = "bolt://localhost:17687"
-    neo4j_user: str = "neo4j"
-    neo4j_password: str = "pga_dev_password"
-
-    # Qdrant
-    qdrant_host: str = "localhost"
-    qdrant_port: int = 16333
-
     # OpenAI (optional - only required when using embedding features)
     openai_api_key: Optional[str] = None
     embedding_model: str = "text-embedding-3-small"
@@ -38,9 +29,13 @@ class Settings(BaseSettings):
     # LlamaExtract (optional - for document extraction)
     llama_cloud_api_key: Optional[str] = None
 
+    # CORS
+    cors_origins: str = "http://localhost:3001"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
 

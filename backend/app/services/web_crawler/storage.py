@@ -1,15 +1,15 @@
-"""Persistence layer for crawl results (Neo4j + Supabase).
+"""Persistence layer for crawl results (Supabase).
 
 Extracted from ``WebCrawlerAgent`` so storage logic can be tested and
 replaced independently.
 """
 
 import logging
+import uuid
 from typing import Optional
 
 from supabase import AsyncClient
 
-from app.models.knowledge_graph import CompanyNode, DigitalAssetNode, DigitalAssetType
 from app.models.web_crawler import (
     AttackSurfaceSummary,
     BusinessContext,
@@ -19,7 +19,6 @@ from app.models.web_crawler import (
     GraphCompany,
     OrganizationInfo,
 )
-from app.services.neo4j_service import Neo4jService
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +27,13 @@ SYSTEM_USER_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 class StorageService:
-    """Handles persistence of crawl results to Neo4j and Supabase."""
+    """Handles persistence of crawl results to Supabase."""
 
-    def __init__(self, neo4j: Neo4jService, supabase: AsyncClient) -> None:
-        self.neo4j = neo4j
+    def __init__(self, supabase: AsyncClient) -> None:
         self.supabase = supabase
 
     # ------------------------------------------------------------------
-    # Neo4j
+    # Graph representations (built in-memory, no external DB needed)
     # ------------------------------------------------------------------
 
     async def store_in_neo4j(
@@ -46,7 +44,7 @@ class StorageService:
     ) -> tuple[
         Optional[GraphCompany], list[GraphAsset], Optional[AttackSurfaceSummary]
     ]:
-        """Persist company + assets to Neo4j and return graph representations.
+        """Build graph representations from crawl data (no Neo4j).
 
         Returns:
             (graph_company, graph_assets, attack_surface)
@@ -54,23 +52,13 @@ class StorageService:
         if not business_context:
             return None, [], None
 
-        company_node = CompanyNode(
-            client_id=request.client_id,
-            project_id=request.project_id,
-            web_domain=request.web_domain,
-            name=business_context.company_name,
-            industry_type=business_context.industry,
-            description=business_context.description,
-        )
-        company_node = await self.neo4j.create_company(company_node)
-
         graph_company = GraphCompany(
-            id=company_node.id,
-            name=company_node.name,
-            domain=company_node.web_domain or request.web_domain,
-            industry=company_node.industry_type,
-            description=company_node.description,
-            project_id=company_node.project_id,
+            id=str(uuid.uuid4()),
+            name=business_context.company_name,
+            domain=request.web_domain,
+            industry=business_context.industry,
+            description=business_context.description,
+            project_id=request.project_id,
         )
 
         graph_assets: list[GraphAsset] = []
@@ -78,45 +66,19 @@ class StorageService:
         tech_stack: set[str] = set()
 
         for asset in assets:
-            try:
-                kg_type_map = {
-                    "subdomain": DigitalAssetType.SUBDOMAIN,
-                    "portal": DigitalAssetType.PORTAL,
-                    "api": DigitalAssetType.API,
-                    "application": DigitalAssetType.APPLICATION,
-                    "website": DigitalAssetType.WEBSITE,
-                }
-                kg_type = kg_type_map.get(asset.asset_type, DigitalAssetType.WEBSITE)
-
-                asset_node = DigitalAssetNode(
-                    project_id=request.project_id,
-                    organization_id=company_node.id or "",
+            graph_assets.append(
+                GraphAsset(
                     url=asset.url,
-                    asset_type=kg_type,
-                    title=asset.description[:100] if asset.description else None,
+                    asset_type=asset.asset_type,
                     description=asset.description,
+                    purpose=asset.purpose,
+                    technology_hints=asset.technology_hints,
                 )
-                asset_node = await self.neo4j.create_digital_asset(
-                    asset_node, company_node.id or ""
-                )
-
-                graph_assets.append(
-                    GraphAsset(
-                        url=asset.url,
-                        asset_type=asset.asset_type,
-                        description=asset.description,
-                        purpose=asset.purpose,
-                        technology_hints=asset.technology_hints,
-                    )
-                )
-
-                asset_type_counts[asset.asset_type] = (
-                    asset_type_counts.get(asset.asset_type, 0) + 1
-                )
-                tech_stack.update(asset.technology_hints)
-
-            except Exception as e:
-                logger.warning(f"Failed to store asset {asset.url}: {e}")
+            )
+            asset_type_counts[asset.asset_type] = (
+                asset_type_counts.get(asset.asset_type, 0) + 1
+            )
+            tech_stack.update(asset.technology_hints)
 
         attack_surface = AttackSurfaceSummary(
             total_assets=len(assets),

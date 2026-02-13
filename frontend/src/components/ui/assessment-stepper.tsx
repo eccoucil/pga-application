@@ -11,11 +11,15 @@ export interface AssessmentStep {
 interface AssessmentStepperProps {
   steps: AssessmentStep[]
   className?: string
+  onStepClick?: (stepNumber: number) => void
 }
 
-export function AssessmentStepper({ steps, className = "" }: AssessmentStepperProps) {
+export function AssessmentStepper({ steps, className = "", onStepClick }: AssessmentStepperProps) {
   const currentStepIndex = steps.findIndex((step) => step.status === "current")
   const progressPercentage = currentStepIndex >= 0 ? ((currentStepIndex + 1) / steps.length) * 100 : 0
+
+  const isClickable = (step: AssessmentStep) =>
+    onStepClick && (step.status === "completed" || step.status === "current")
 
   return (
     <div className={`mb-10 relative ${className}`}>
@@ -23,11 +27,30 @@ export function AssessmentStepper({ steps, className = "" }: AssessmentStepperPr
         {steps.map((step, index) => (
           <div key={step.number} className="flex flex-col items-center gap-3 flex-1">
             <div
+              role={isClickable(step) ? "button" : undefined}
+              tabIndex={isClickable(step) ? 0 : undefined}
+              onClick={isClickable(step) ? () => onStepClick!(step.number) : undefined}
+              onKeyDown={
+                isClickable(step)
+                  ? (e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault()
+                        onStepClick!(step.number)
+                      }
+                    }
+                  : undefined
+              }
               className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm border-2 transition-all duration-300 ${
                 step.status === "current"
-                  ? "bg-gradient-to-tr from-purple-600 to-indigo-600 border-purple-400 text-white shadow-[0_0_15px_rgba(168,85,247,0.5)] scale-110"
+                  ? `bg-gradient-to-tr from-purple-600 to-indigo-600 border-purple-400 text-white shadow-[0_0_15px_rgba(168,85,247,0.5)] scale-110${
+                      onStepClick ? " cursor-pointer hover:shadow-[0_0_20px_rgba(168,85,247,0.7)]" : ""
+                    }`
                   : step.status === "completed"
-                  ? "bg-emerald-500 border-emerald-400 text-white"
+                  ? `bg-emerald-500 border-emerald-400 text-white${
+                      onStepClick
+                        ? " cursor-pointer hover:scale-110 hover:shadow-[0_0_10px_rgba(16,185,129,0.4)]"
+                        : ""
+                    }`
                   : "bg-[#0f1016] border-white/10 text-slate-500"
               }`}
             >

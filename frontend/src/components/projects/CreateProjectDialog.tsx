@@ -15,13 +15,6 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Checkbox } from "@/components/ui/checkbox"
 import { DatePicker } from "@/components/ui/date-picker"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
 import { Loader2 } from "lucide-react"
 import type { CreateProjectData, ProjectStatus } from "@/types/project"
 import { FRAMEWORK_OPTIONS } from "@/types/project"
@@ -41,7 +34,7 @@ export function CreateProjectDialog({
   const [formData, setFormData] = useState({
     name: "",
     description: "",
-    status: "planning" as ProjectStatus,
+    status: "started" as ProjectStatus,
   })
   const [startDate, setStartDate] = useState<Date | undefined>(undefined)
   const [endDate, setEndDate] = useState<Date | undefined>(undefined)
@@ -64,7 +57,7 @@ export function CreateProjectDialog({
       const submitData: CreateProjectData = {
         name: formData.name,
         description: formData.description || undefined,
-        status: formData.status,
+        status: "started",
         framework: frameworks.length > 0 ? frameworks : undefined,
         start_date: startDate ? format(startDate, "yyyy-MM-dd") : undefined,
         end_date: endDate ? format(endDate, "yyyy-MM-dd") : undefined,
@@ -74,7 +67,7 @@ export function CreateProjectDialog({
       setFormData({
         name: "",
         description: "",
-        status: "planning",
+        status: "started",
       })
       setStartDate(undefined)
       setEndDate(undefined)
@@ -224,20 +217,12 @@ export function CreateProjectDialog({
               <Label htmlFor="status" className="text-xs font-medium text-slate-400 uppercase tracking-wider">
                 Status
               </Label>
-              <Select
-                value={formData.status}
-                onValueChange={(value) => handleChange("status", value as ProjectStatus)}
-              >
-                <SelectTrigger className="bg-black/40 border border-white/10 text-white focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50">
-                  <SelectValue placeholder="Select status" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="planning">Planning</SelectItem>
-                  <SelectItem value="in-progress">In Progress</SelectItem>
-                  <SelectItem value="completed">Completed</SelectItem>
-                  <SelectItem value="on-hold">On Hold</SelectItem>
-                </SelectContent>
-              </Select>
+              <Input
+                id="status"
+                value="Started"
+                disabled
+                className="bg-black/40 border border-white/10 text-slate-400 cursor-not-allowed opacity-60"
+              />
             </div>
           </div>
 

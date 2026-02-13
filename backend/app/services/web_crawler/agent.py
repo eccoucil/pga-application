@@ -14,7 +14,6 @@ from supabase import AsyncClient
 
 from app.config import get_settings
 from app.models.web_crawler import CrawlRequest, CrawlResult, PageData, SecurityContext
-from app.services.neo4j_service import Neo4jService
 from app.services.web_crawler.asset_discovery import AssetDiscoveryAgent
 from app.services.web_crawler.business_analyzer import BusinessContextAnalyzer
 from app.services.web_crawler.confidence import calculate_confidence
@@ -43,7 +42,6 @@ class WebCrawlerAgent:
     def __init__(
         self,
         anthropic_client: anthropic.AsyncAnthropic,
-        neo4j_service: Neo4jService,
         supabase_client: AsyncClient,
         *,
         crawl_coordinator: Optional[CrawlCoordinator] = None,
@@ -74,7 +72,7 @@ class WebCrawlerAgent:
         )
 
         # Storage
-        self.storage = storage or StorageService(neo4j_service, supabase_client)
+        self.storage = storage or StorageService(supabase_client)
 
     async def crawl_domain(self, request: CrawlRequest, user_id: str) -> CrawlResult:
         """Main entry point: crawl domain and extract intelligence."""
@@ -158,8 +156,8 @@ class WebCrawlerAgent:
                 attack_surface,
             ) = await self.storage.store_in_neo4j(request, business_context, assets)
         except Exception as e:
-            logger.error(f"Neo4j storage failed: {e}")
-            errors.append(f"Graph storage failed: {e!s}")
+            # Neo4j storage is non-critical — data is in Supabase
+            logger.warning(f"Neo4j storage failed (non-critical): {e}")
 
         try:
             await self.storage.store_in_supabase(
@@ -218,14 +216,11 @@ async def get_web_crawler_agent() -> WebCrawlerAgent:
         anthropic_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
 
         from app.db.supabase import get_async_supabase_client_async
-        from app.services.neo4j_service import get_neo4j_service
 
-        neo4j = get_neo4j_service()
         supabase = await get_async_supabase_client_async()
 
         _agent = WebCrawlerAgent(
             anthropic_client=anthropic_client,
-            neo4j_service=neo4j,
             supabase_client=supabase,
         )
 

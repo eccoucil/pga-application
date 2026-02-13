@@ -43,7 +43,7 @@ export function EditProjectDialog({
   const [formData, setFormData] = useState({
     name: "",
     description: "",
-    status: "planning" as ProjectStatus,
+    status: "started" as ProjectStatus,
   })
   const [startDate, setStartDate] = useState<Date | undefined>(undefined)
   const [endDate, setEndDate] = useState<Date | undefined>(undefined)
@@ -258,10 +258,9 @@ export function EditProjectDialog({
                   <SelectValue placeholder="Select status" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="planning">Planning</SelectItem>
-                  <SelectItem value="in-progress">In Progress</SelectItem>
+                  <SelectItem value="started">Started</SelectItem>
+                  <SelectItem value="on-going">On-going</SelectItem>
                   <SelectItem value="completed">Completed</SelectItem>
-                  <SelectItem value="on-hold">On Hold</SelectItem>
                 </SelectContent>
               </Select>
             </div>

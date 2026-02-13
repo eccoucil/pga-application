@@ -28,10 +28,9 @@ const frameworkOptions = [
 ]
 
 const statusOptions = [
-  { value: "planning", label: "Planning" },
-  { value: "in-progress", label: "In Progress" },
+  { value: "started", label: "Started" },
+  { value: "on-going", label: "On-going" },
   { value: "completed", label: "Completed" },
-  { value: "on-hold", label: "On Hold" },
 ]
 
 export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalProps) {
@@ -41,7 +40,7 @@ export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalP
     framework: [],
     start_date: "",
     end_date: "",
-    status: "planning",
+    status: "started",
   })
 
   const [errors, setErrors] = useState<FormErrors>({})
@@ -66,7 +65,7 @@ export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalP
         framework: [],
         start_date: "",
         end_date: "",
-        status: "planning",
+        status: "started",
       })
     }
     setErrors({})
@@ -323,7 +322,8 @@ export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalP
               name="status"
               value={formData.status}
               onChange={handleInputChange}
-              className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50 transition-all"
+              disabled={!project}
+              className={`w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50 transition-all ${!project ? "opacity-60 cursor-not-allowed" : ""}`}
             >
               {statusOptions.map((option) => (
                 <option key={option.value} value={option.value}>

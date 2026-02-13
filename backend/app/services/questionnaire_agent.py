@@ -8,6 +8,7 @@ for all selected framework controls.
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -75,7 +76,62 @@ TOOLS = [
             },
             "required": ["question"],
         },
-    }
+    },
+    {
+        "name": "generateQuestionnaire",
+        "description": (
+            "Call this when you have collected enough information from the user "
+            "and are ready to generate the compliance assessment questions. "
+            "Pass the criteria you gathered from the conversation."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "maturity_level": {
+                    "type": "string",
+                    "enum": [
+                        "first_assessment",
+                        "early_stage",
+                        "developing",
+                        "recurring_assessment",
+                        "mature",
+                    ],
+                    "description": "The organization's compliance maturity level based on conversation",
+                },
+                "question_depth": {
+                    "type": "string",
+                    "enum": [
+                        "high_level_overview",
+                        "balanced",
+                        "detailed_technical",
+                    ],
+                    "description": "How detailed the questions should be",
+                },
+                "priority_domains": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Control domains to prioritize (e.g. ['A.5', 'A.8'] for ISO "
+                        "or section titles for BNM). Empty array for all."
+                    ),
+                },
+                "compliance_concerns": {
+                    "type": "string",
+                    "description": "Specific compliance concerns or known gaps mentioned by the user",
+                },
+                "criteria_summary": {
+                    "type": "string",
+                    "description": "A brief human-readable summary of the generation criteria gathered",
+                },
+                "questions_per_control": {
+                    "type": "integer",
+                    "description": "Number of questions to generate per control, as specified by the user. Options: 2, 3, or 5.",
+                    "enum": [2, 3, 5],
+                },
+            },
+            "required": ["maturity_level", "question_depth", "criteria_summary"],
+        },
+    },
 ]
 
 
@@ -219,35 +275,7 @@ class QuestionnaireAgent:
         client_id = context.get("client_id", "")
 
         # Prepare for batching
-        iso_controls = context.get("iso_controls", [])
-        bnm_controls = context.get("bnm_controls", [])
-        
-        # Combine controls with domain/section metadata for filtering
-        all_controls = []
-        for c in iso_controls:
-            identifier = c.get("identifier", "")
-            # Derive domain prefix (e.g. "A.5" from "A.5.1")
-            parts = identifier.split(".")
-            if len(parts) >= 2 and parts[0] == "A":
-                domain = f"A.{parts[1]}"
-            else:
-                # Management clauses (4-10) are plain integers
-                domain = identifier.split(".")[0] if identifier else ""
-            all_controls.append({
-                "id": identifier,
-                "title": c.get("title"),
-                "framework": "ISO 27001:2022",
-                "desc": c.get("description", ""),
-                "domain": domain,
-            })
-        for c in bnm_controls:
-            all_controls.append({
-                "id": c.get("reference_id"),
-                "title": c.get("title"),
-                "framework": "BNM RMIT",
-                "desc": c.get("description", ""),
-                "section_title": c.get("section_title", ""),
-            })
+        all_controls = self._build_controls_list(context)
 
         # Filter controls when priority_domains is specified
         if priority_domains:
@@ -297,10 +325,7 @@ class QuestionnaireAgent:
         for i, batch in enumerate(batches):
             logger.info(f"Processing batch {i+1}/{len(batches)} ({len(batch)} controls)")
             
-            # Format this batch's controls (include framework so LLM assigns it correctly)
-            batch_controls_text = ""
-            for c in batch:
-                batch_controls_text += f"- **{c['id']}** [{c['framework']}]: {c['title']} — {c['desc'][:200]}\n"
+            batch_controls_text = self._format_batch_controls(batch)
 
             # Build a specialized prompt for this batch
             batch_system_prompt = self._build_batch_system_prompt(
@@ -372,18 +397,22 @@ class QuestionnaireAgent:
         priority_domains: list[str],
         compliance_concerns: str | None,
         controls_to_skip: str | None,
+        questions_per_control: int | None = None,
     ) -> str:
         """Build system prompt for a specific batch of controls."""
         org_name = context.get("organization_name", "the organization")
         industry = context.get("industry", "unspecified")
 
-        # Map depth to question count
-        depth_map = {
-            "high_level_overview": "2 questions per control",
-            "balanced": "3 questions per control",
-            "detailed_technical": "4-5 questions per control",
-        }
-        q_count = depth_map.get(question_depth, "3 questions per control")
+        # Use explicit user choice if provided, otherwise fall back to depth_map
+        if questions_per_control:
+            q_count = f"{questions_per_control} questions per control"
+        else:
+            depth_map = {
+                "high_level_overview": "2 questions per control",
+                "balanced": "3 questions per control",
+                "detailed_technical": "4-5 questions per control",
+            }
+            q_count = depth_map.get(question_depth, "3 questions per control")
 
         # Map maturity to complexity guidance
         maturity_map = {
@@ -645,32 +674,32 @@ Ensure questions are specific to {org_name}'s context."""
         else:
             context["bnm_controls"] = []
 
-        # Neo4j organization context (optional, non-blocking)
+        # Document metadata from Supabase (optional, non-blocking)
         try:
-            from app.services.neo4j_service import get_neo4j_service
-
-            neo4j = get_neo4j_service()
-            org_context = await neo4j.get_organization_context(
-                client_id, project_id
+            docs_res = (
+                await sb.table("project_documents")
+                .select("filename, format, word_count")
+                .eq("project_id", project_id)
+                .execute()
             )
-            if org_context:
-                context["neo4j_context"] = org_context
+            if docs_res.data:
+                context["project_documents"] = docs_res.data
         except Exception as e:
-            logger.warning(f"Neo4j context fetch failed (non-critical): {e}")
+            logger.warning(f"Document metadata fetch failed (non-critical): {e}")
 
-        # Qdrant document chunks (optional, non-blocking)
+        # Document chunks via pgvector (optional, non-blocking)
         try:
-            from app.services.qdrant_service import get_qdrant_service
+            from app.services.supabase_vector_service import get_supabase_vector_service
 
-            qdrant = get_qdrant_service()
-            chunks = await qdrant.search_company_extractions(
+            vector_svc = get_supabase_vector_service()
+            chunks = await vector_svc.search_client_extractions(
                 client_id=client_id,
                 query="compliance policy information security",
                 limit=10,
             )
             context["document_chunks"] = chunks
         except Exception as e:
-            logger.warning(f"Qdrant search failed (non-critical): {e}")
+            logger.warning(f"pgvector search failed (non-critical): {e}")
 
         return context
 
@@ -685,10 +714,9 @@ Ensure questions are specific to {org_name}'s context."""
         frameworks = context.get("selected_frameworks", [])
         business_ctx = context.get("business_context", {})
         findings = context.get("findings", [])
-        neo4j_ctx = context.get("neo4j_context", {})
 
-        # Summarise documents from Neo4j context
-        docs = neo4j_ctx.get("documents", []) if isinstance(neo4j_ctx, dict) else []
+        # Summarise documents from project_documents context
+        docs = context.get("project_documents", [])
         doc_names = [d.get("filename", "unknown") for d in docs if d]
 
         # Build framework controls section
@@ -702,9 +730,7 @@ Ensure questions are specific to {org_name}'s context."""
         # Findings summary
         findings_summary = f"{len(findings)} existing findings" if findings else "No existing findings"
 
-        scope_stmt = ""
-        if isinstance(neo4j_ctx, dict):
-            scope_stmt = neo4j_ctx.get("scope_statement_isms", "")
+        scope_stmt = context.get("scope_statement_isms", "")
 
         return f"""You are a Senior ISMS Compliance Consultant & Auditor.
 
@@ -724,39 +750,16 @@ Existing Findings: {findings_summary}
 {controls_text}
 
 ## Instructions
-1. First, use the askQuestionToMe tool to understand the user's criteria for question generation. Key areas to explore:
-   - Question depth preference (high-level overview vs detailed technical questions)
+1. Use the askQuestionToMe tool to understand the user's criteria. Key areas:
+   - **Questions per control (REQUIRED)**: You MUST ask the user how many questions they want generated per control. Present these options: 2 (high-level overview), 3 (balanced), or 4-5 (detailed technical). This is a required question — do not skip it.
    - Priority focus areas (which control domains matter most)
    - Specific compliance concerns or known gaps
    - Assessment maturity level (first-time vs recurring audit)
    - Any controls to skip or emphasize
-2. Ask 2-4 clarifying questions total. Ask them one at a time — ask, listen to the answer, then decide if you need more context.
-3. Once you have enough context, generate questions for EVERY control in the selected frameworks.
-4. When you are done asking questions and ready to generate, output your response as a JSON array of objects with this exact schema:
+2. Ask 2-4 clarifying questions total, one at a time. The questions-per-control question should be one of them.
+3. Once you have enough context, call the generateQuestionnaire tool with the criteria you've gathered, including the questions_per_control value. Do NOT output questions directly — the system will generate them in optimized batches.
 
-```json
-[
-  {{
-    "control_id": "Control ID from the list",
-    "control_title": "Control title from the list",
-    "framework": "The framework this control belongs to (e.g. ISO 27001:2022 or BNM RMIT)",
-    "questions": [
-      {{
-        "id": "q-<unique-id>",
-        "question": "The assessment question text",
-        "category": "policy_existence|implementation|monitoring|effectiveness|documentation",
-        "priority": "high|medium|low",
-        "expected_evidence": "What evidence the assessor should look for",
-        "guidance_notes": "Hints for the assessor on evaluating the answer"
-      }}
-    ]
-  }}
-]
-```
-
-IMPORTANT: Set the "framework" field to match the actual framework each control belongs to (e.g. "BNM RMIT" for BNM controls, "ISO 27001:2022" for ISO controls).
-
-Generate 2-5 questions per control depending on the user's depth preference. Ensure questions are specific to {org_name}'s context, not generic boilerplate."""
+IMPORTANT: Always end the conversation by calling generateQuestionnaire. Never try to output a JSON array of questions yourself."""
 
     def _format_controls(self, context: dict) -> str:
         """Format framework controls for the system prompt."""
@@ -779,8 +782,8 @@ Generate 2-5 questions per control depending on the user's depth preference. Ens
                 parts.append("\n### BNM RMIT Controls")
                 for c in bnm_controls[:100]: # Hard limit to 100
                     ref = c.get("reference_id", "")
-                    title = c.get("title", "")
-                    desc = c.get("requirement_text", "")[:150] # Fixed key name
+                    title = c.get("subsection_title") or c.get("section_title", "")
+                    desc = c.get("requirement_text", "")[:150]
                     parts.append(f"- **{ref}**: {title} — {desc}")
 
         return "\n".join(parts) if parts else "No framework controls loaded."
@@ -794,6 +797,7 @@ Generate 2-5 questions per control depending on the user's depth preference. Ens
         priority_domains: list[str],
         compliance_concerns: str | None,
         controls_to_skip: str | None,
+        questions_per_control: int | None = None,
     ) -> str:
         """Build system prompt with structured criteria baked in."""
         org_name = context.get("organization_name", "the organization")
@@ -801,9 +805,7 @@ Generate 2-5 questions per control depending on the user's depth preference. Ens
         frameworks = context.get("selected_frameworks", [])
         business_ctx = context.get("business_context", {})
         findings = context.get("findings", [])
-        neo4j_ctx = context.get("neo4j_context", {})
-
-        docs = neo4j_ctx.get("documents", []) if isinstance(neo4j_ctx, dict) else []
+        docs = context.get("project_documents", [])
         doc_names = [d.get("filename", "unknown") for d in docs if d]
         controls_text = self._format_controls(context)
         biz_summary = ""
@@ -812,17 +814,18 @@ Generate 2-5 questions per control depending on the user's depth preference. Ens
         findings_summary = (
             f"{len(findings)} existing findings" if findings else "No existing findings"
         )
-        scope_stmt = ""
-        if isinstance(neo4j_ctx, dict):
-            scope_stmt = neo4j_ctx.get("scope_statement_isms", "")
+        scope_stmt = context.get("scope_statement_isms", "")
 
-        # Map depth to question count
-        depth_map = {
-            "high_level_overview": "2 questions per control",
-            "balanced": "3 questions per control",
-            "detailed_technical": "4-5 questions per control",
-        }
-        q_count = depth_map.get(question_depth, "3 questions per control")
+        # Use explicit user choice if provided, otherwise fall back to depth_map
+        if questions_per_control:
+            q_count = f"{questions_per_control} questions per control"
+        else:
+            depth_map = {
+                "high_level_overview": "2 questions per control",
+                "balanced": "3 questions per control",
+                "detailed_technical": "4-5 questions per control",
+            }
+            q_count = depth_map.get(question_depth, "3 questions per control")
 
         # Map maturity to complexity guidance
         maturity_map = {
@@ -928,6 +931,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
         priority_domains: list[str],
         compliance_concerns: str | None,
         controls_to_skip: str | None,
+        questions_per_control: int | None = None,
     ) -> str:
         """Build a human-readable criteria summary from structured inputs."""
         maturity_labels = {
@@ -945,6 +949,8 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             f"Maturity: {maturity_labels.get(maturity_level, maturity_level)}",
             f"Depth: {depth_labels.get(question_depth, question_depth)}",
         ]
+        if questions_per_control:
+            parts.append(f"Questions/control: {questions_per_control}")
         if priority_domains:
             parts.append(f"Priority domains: {', '.join(priority_domains)}")
         if compliance_concerns:
@@ -968,15 +974,13 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
           - Substring containment between domain label and section_title
             (handles label mismatches like "Risk Management" ↔ "Technology Risk Management")
         """
-        import re as _re
-
         iso_prefixes: list[str] = []
         include_management_clauses = False
         bnm_labels: list[str] = []
 
         for domain in priority_domains:
             # Check for ISO Annex A prefix pattern like "A.5", "A.7"
-            m = _re.match(r"^(A\.\d+)", domain)
+            m = re.match(r"^(A\.\d+)", domain)
             if m:
                 iso_prefixes.append(m.group(1))
             elif "clauses 4-10" in domain.lower() or "clauses 4–10" in domain.lower():
@@ -1002,11 +1006,17 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
 
             if fw == "BNM RMIT":
                 section = ctrl.get("section_title", "").lower()
+                section_num = ctrl.get("section_number")
                 for label in bnm_labels:
                     # Bidirectional substring: "risk management" in
                     # "technology risk management" OR vice versa
                     if label in section or section in label:
                         return True
+                    # Numeric matching: "Sections 8-9" or "Section 8"
+                    if section_num is not None:
+                        nums = re.findall(r'\d+', label)
+                        if str(section_num) in nums:
+                            return True
                 return False
 
             return False
@@ -1047,7 +1057,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             tool_block = next(
                 (b for b in response.content if b.type == "tool_use"), None
             )
-            if tool_block:
+            if tool_block and tool_block.name == "askQuestionToMe":
                 session.pending_tool_use_id = tool_block.id
 
                 return AgentQuestion(
@@ -1056,6 +1066,15 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
                     context=tool_block.input.get("context"),
                     options=tool_block.input.get("options"),
                 )
+
+            if tool_block and tool_block.name == "generateQuestionnaire":
+                # Extract criteria from tool input and run batch generation
+                criteria = tool_block.input
+                logger.info(
+                    f"Session {session.session_id}: agent called generateQuestionnaire, "
+                    f"starting batch generation with criteria: {criteria}"
+                )
+                return await self._run_batch_generation(session, criteria)
 
         # If it's not a tool use, check if it contains JSON questions
         text = ""
@@ -1073,6 +1092,161 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             session_id=session.session_id,
             question=text.strip() or "I need more information to generate the questions. Could you please clarify your requirements?",
             context="The agent provided a text response instead of using a tool or generating JSON."
+        )
+
+    # ------------------------------------------------------------------
+    # Batch generation from conversational criteria
+    # ------------------------------------------------------------------
+
+    def _build_controls_list(self, context: dict) -> list[dict]:
+        """Build a unified controls list from project context.
+
+        Shared by both ``generate_with_criteria`` (wizard flow) and
+        ``_run_batch_generation`` (conversational flow).
+        """
+        iso_controls = context.get("iso_controls", [])
+        bnm_controls = context.get("bnm_controls", [])
+
+        all_controls: list[dict] = []
+        for c in iso_controls:
+            identifier = c.get("identifier", "")
+            parts = identifier.split(".")
+            if len(parts) >= 2 and parts[0] == "A":
+                domain = f"A.{parts[1]}"
+            else:
+                domain = identifier.split(".")[0] if identifier else ""
+            all_controls.append({
+                "id": identifier,
+                "title": c.get("title"),
+                "framework": "ISO 27001:2022",
+                "desc": c.get("description", "")[:200],
+                "domain": domain,
+            })
+        for c in bnm_controls:
+            all_controls.append({
+                "id": c.get("reference_id"),
+                "title": c.get("subsection_title") or c.get("section_title", ""),
+                "framework": "BNM RMIT",
+                "desc": c.get("requirement_text", "")[:200],
+                "section_title": c.get("section_title", ""),
+                "section_number": c.get("section_number"),
+            })
+        return all_controls
+
+    @staticmethod
+    def _format_batch_controls(batch: list[dict]) -> str:
+        """Format a batch of controls into text for the batch system prompt."""
+        lines: list[str] = []
+        for c in batch:
+            section_ctx = f" ({c['section_title']})" if c.get("section_title") else ""
+            lines.append(
+                f"- **{c['id']}** [{c['framework']}]{section_ctx}: {c['title']} — {c['desc']}"
+            )
+        return "\n".join(lines)
+
+    async def _run_batch_generation(
+        self,
+        session: QuestionnaireSession,
+        criteria: dict,
+    ) -> QuestionnaireComplete:
+        """Run batch question generation using criteria from the conversation."""
+        context = session.project_context
+        maturity_level = criteria.get("maturity_level", "developing")
+        question_depth = criteria.get("question_depth", "balanced")
+        priority_domains = criteria.get("priority_domains") or []
+        compliance_concerns = criteria.get("compliance_concerns")
+        criteria_summary = criteria.get("criteria_summary", "")
+        questions_per_control = criteria.get("questions_per_control")
+
+        all_controls = self._build_controls_list(context)
+
+        if priority_domains:
+            all_controls = self._filter_controls(all_controls, priority_domains)
+            logger.info(
+                f"Filtered to {len(all_controls)} controls for priority domains: "
+                f"{priority_domains}"
+            )
+
+        if not all_controls:
+            session.status = "completed"
+            elapsed_ms = int(time.time() * 1000) - session.started_at_ms
+            return QuestionnaireComplete(
+                session_id=session.session_id,
+                controls=[],
+                total_controls=0,
+                total_questions=0,
+                generation_time_ms=elapsed_ms,
+                criteria_summary=criteria_summary,
+            )
+
+        batch_size = 15
+        batches = [
+            all_controls[i : i + batch_size]
+            for i in range(0, len(all_controls), batch_size)
+        ]
+        all_generated: list[ControlQuestions] = []
+
+        logger.info(
+            f"Session {session.session_id}: starting batch generation for "
+            f"{len(all_controls)} controls in {len(batches)} batches"
+        )
+
+        for i, batch in enumerate(batches):
+            logger.info(
+                f"Session {session.session_id}: processing batch "
+                f"{i + 1}/{len(batches)} ({len(batch)} controls)"
+            )
+            batch_text = self._format_batch_controls(batch)
+            batch_prompt = self._build_batch_system_prompt(
+                context,
+                batch_text,
+                maturity_level=maturity_level,
+                question_depth=question_depth,
+                priority_domains=priority_domains,
+                compliance_concerns=compliance_concerns,
+                controls_to_skip=None,
+                questions_per_control=questions_per_control,
+            )
+            try:
+                resp = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=CRITERIA_MAX_TOKENS,
+                    system=batch_prompt,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": "Generate the compliance assessment questions for these specific controls.",
+                        }
+                    ],
+                )
+                text = "".join(
+                    b.text for b in resp.content if hasattr(b, "text")
+                )
+                all_generated.extend(
+                    self._parse_questions(text, session.session_id)
+                )
+            except Exception as e:
+                logger.error(
+                    f"Session {session.session_id}: batch {i + 1}/{len(batches)} "
+                    f"failed: {e}"
+                )
+                continue
+
+        total_q = sum(len(c.questions) for c in all_generated)
+        elapsed_ms = int(time.time() * 1000) - session.started_at_ms
+        session.status = "completed"
+
+        await self._persist_results(
+            session, all_generated, total_q, elapsed_ms, criteria_summary
+        )
+
+        return QuestionnaireComplete(
+            session_id=session.session_id,
+            controls=all_generated,
+            total_controls=len(all_generated),
+            total_questions=total_q,
+            generation_time_ms=elapsed_ms,
+            criteria_summary=criteria_summary,
         )
 
     async def _handle_completion(

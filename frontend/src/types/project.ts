@@ -1,4 +1,4 @@
-export type ProjectStatus = 'planning' | 'in-progress' | 'completed' | 'on-hold'
+export type ProjectStatus = 'started' | 'on-going' | 'completed'
 
 export interface Project {
   id: string

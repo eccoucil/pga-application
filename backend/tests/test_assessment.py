@@ -1,10 +1,14 @@
 """Tests for assessment endpoints."""
 
+import uuid
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
 from app.auth.dependencies import get_current_user
+from app.models.assessment import DocumentResult
 from app.services.assessment_orchestrator import reset_orchestrator
 
 
@@ -45,15 +49,27 @@ class TestHealthEndpoint:
         response = client.get("/health")
         assert response.status_code == 200
         data = response.json()
-        # Status can be "healthy" or "degraded" depending on Neo4j/Qdrant availability
+        # Status can be "healthy" or "degraded" depending on Supabase availability
         assert data["status"] in ["healthy", "degraded"]
 
 
 class TestAssessmentSubmit:
     """Tests for POST /assessment/submit endpoint."""
 
-    def test_submit_assessment_success(self, client, sample_document):
+    @patch(
+        "app.services.assessment_orchestrator.AssessmentOrchestrator._process_single_document",
+        new_callable=AsyncMock,
+    )
+    def test_submit_assessment_success(
+        self, mock_process_doc, client, sample_document
+    ):
         """Successfully submit an assessment with a document."""
+        mock_process_doc.return_value = DocumentResult(
+            document_id=str(uuid.uuid4()),
+            filename="policy.txt",
+            status="pending",
+        )
+
         with open(sample_document, "rb") as f:
             response = client.post(
                 "/assessment/submit",

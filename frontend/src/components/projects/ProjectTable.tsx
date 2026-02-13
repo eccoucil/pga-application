@@ -17,21 +17,17 @@ interface ProjectTableProps {
 }
 
 const statusConfig = {
-  planning: {
-    label: "Planning",
+  started: {
+    label: "Started",
     className: "bg-orange-500/10 text-orange-400 border-orange-500/20 shadow-orange-900/20",
   },
-  "in-progress": {
-    label: "In Progress",
+  "on-going": {
+    label: "On-going",
     className: "bg-blue-500/10 text-blue-400 border-blue-500/20 shadow-blue-900/20",
   },
   completed: {
     label: "Completed",
     className: "bg-emerald-500/10 text-emerald-400 border-emerald-500/20 shadow-emerald-900/20",
-  },
-  "on-hold": {
-    label: "On Hold",
-    className: "bg-slate-500/10 text-slate-400 border-slate-500/20 shadow-slate-900/20",
   },
 }
 
@@ -142,29 +138,29 @@ export function ProjectTable({
                 </button>
                 <button
                   onClick={() => {
-                    onStatusFilterChange("planning")
+                    onStatusFilterChange("started")
                     setIsFilterOpen(false)
                   }}
                   className={`w-full text-left px-4 py-2 text-sm transition-colors ${
-                    statusFilter === "planning"
+                    statusFilter === "started"
                       ? "bg-purple-500/10 text-purple-300"
                       : "text-slate-300 hover:bg-white/5 hover:text-white"
                   }`}
                 >
-                  Planning
+                  Started
                 </button>
                 <button
                   onClick={() => {
-                    onStatusFilterChange("in-progress")
+                    onStatusFilterChange("on-going")
                     setIsFilterOpen(false)
                   }}
                   className={`w-full text-left px-4 py-2 text-sm transition-colors ${
-                    statusFilter === "in-progress"
+                    statusFilter === "on-going"
                       ? "bg-purple-500/10 text-purple-300"
                       : "text-slate-300 hover:bg-white/5 hover:text-white"
                   }`}
                 >
-                  In Progress
+                  On-going
                 </button>
                 <button
                   onClick={() => {
@@ -178,19 +174,6 @@ export function ProjectTable({
                   }`}
                 >
                   Completed
-                </button>
-                <button
-                  onClick={() => {
-                    onStatusFilterChange("on-hold")
-                    setIsFilterOpen(false)
-                  }}
-                  className={`w-full text-left px-4 py-2 text-sm transition-colors ${
-                    statusFilter === "on-hold"
-                      ? "bg-purple-500/10 text-purple-300"
-                      : "text-slate-300 hover:bg-white/5 hover:text-white"
-                  }`}
-                >
-                  On Hold
                 </button>
               </div>
             )}
@@ -217,7 +200,7 @@ export function ProjectTable({
           </thead>
           <tbody className="divide-y divide-white/5">
             {filteredProjects.map((project) => {
-              const status = statusConfig[project.status as keyof typeof statusConfig] || statusConfig.planning
+              const status = statusConfig[project.status as keyof typeof statusConfig] || statusConfig.started
 
               return (
                 <tr key={project.id} className="group hover:bg-white/[0.02] transition-colors">
@@ -271,11 +254,9 @@ export function ProjectTable({
                         className={`w-1.5 h-1.5 rounded-full mr-1.5 ${
                           project.status === "completed"
                             ? "bg-emerald-400"
-                            : project.status === "in-progress"
+                            : project.status === "on-going"
                             ? "bg-blue-400"
-                            : project.status === "planning"
-                            ? "bg-orange-400"
-                            : "bg-slate-400"
+                            : "bg-orange-400"
                         }`}
                       ></span>
                       {status.label}

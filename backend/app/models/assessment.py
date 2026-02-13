@@ -207,7 +207,7 @@ class AssessmentSummary(BaseModel):
     )
     next_step: str = Field(
         default="review_findings",
-        description="Suggested next action: review_findings, upload_more_docs, start_questionnaire",
+        description="Suggested next action: review_findings, upload_more_docs",
     )
     next_step_url: Optional[str] = Field(
         None, description="Relative URL for next step navigation"
@@ -240,3 +240,37 @@ class AssessmentResponse(BaseModel):
     summary: AssessmentSummary = Field(
         ..., description="Human-readable summary for frontend display"
     )
+
+
+class AssessmentRecord(BaseModel):
+    """Lightweight assessment record for table display."""
+
+    id: str
+    version: int
+    organization_name: str
+    industry_type: str
+    department: str
+    status: str
+    documents_count: int
+    created_at: str
+class AssessmentListResponse(BaseModel):
+    """Response for GET /assessment/list."""
+
+    assessments: list[AssessmentRecord]
+    total: int
+
+
+class AssessmentDetailResponse(BaseModel):
+    """Full assessment detail for viewing/editing."""
+    id: str
+    version: int
+    organization_name: str
+    nature_of_business: str
+    industry_type: str
+    department: str
+    scope_statement_isms: str
+    web_domain: Optional[str] = None
+    status: str
+    documents_count: int
+    response_snapshot: Optional[dict] = None
+    created_at: str

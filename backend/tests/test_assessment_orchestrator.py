@@ -290,7 +290,7 @@ class TestOrchestratorParallelExecution:
                 "app.services.web_crawler_agent.get_web_crawler_agent"
             ) as mock_get_agent,
         ):
-            mock_extract.return_value = {"status": "success", "qdrant_chunks": 5}
+            mock_extract.return_value = {"status": "success", "pgvector_chunks": 5}
 
             # Mock web crawler agent
             mock_agent = MagicMock()
@@ -329,7 +329,7 @@ class TestOrchestratorErrorIsolation:
                 "app.services.web_crawler_agent.get_web_crawler_agent"
             ) as mock_get_agent,
         ):
-            mock_extract.return_value = {"status": "success", "qdrant_chunks": 5}
+            mock_extract.return_value = {"status": "success", "pgvector_chunks": 5}
 
             # Mock web crawler to fail
             mock_get_agent.side_effect = Exception("Web crawl connection error")
@@ -552,7 +552,7 @@ class TestOrchestratorConcurrency:
             processing_order.append(f"start_{filename}")
             await asyncio.sleep(0.01)  # Small delay to allow interleaving
             processing_order.append(f"end_{filename}")
-            return {"status": "success", "qdrant_chunks": 1}
+            return {"status": "success", "pgvector_chunks": 1}
 
         with patch(
             "app.services.assessment_orchestrator.AssessmentOrchestrator._process_document_extraction",

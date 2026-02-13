@@ -122,7 +122,7 @@ export interface AssessmentSummary {
   headline: string;
   processing_time_ms: number;
   highlights: string[];
-  next_step: "review_findings" | "upload_more_docs" | "start_questionnaire";
+  next_step: "review_findings" | "upload_more_docs";
   next_step_url: string | null;
 }
 
@@ -140,4 +140,36 @@ export interface AssessmentResponse {
   organization_context: OrganizationContextSummary;
   knowledge_graph: KnowledgeGraph;
   summary: AssessmentSummary;
+}
+
+/**
+ * Lightweight assessment record for table display
+ */
+export interface AssessmentRecord {
+  id: string;
+  version: number;
+  organization_name: string;
+  industry_type: string;
+  department: string;
+  status: "received" | "processing" | "completed" | "failed" | "partial";
+  documents_count: number;
+  created_at: string;
+}
+
+/**
+ * Full assessment detail from GET /assessment/detail/{id}
+ */
+export interface AssessmentDetail {
+  id: string;
+  version: number;
+  organization_name: string;
+  nature_of_business: string;
+  industry_type: string;
+  department: string;
+  scope_statement_isms: string;
+  web_domain: string | null;
+  status: string;
+  documents_count: number;
+  response_snapshot: Record<string, unknown> | null;
+  created_at: string;
 }

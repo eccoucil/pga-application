@@ -15,7 +15,7 @@ import { getClients, addClient, updateClient, deleteClient } from "@/lib/supabas
 
 export function ClientManagement() {
   const router = useRouter()
-  const { user } = useAuth()
+  const { user, loading: authLoading } = useAuth()
   const { setSelectedClient: setContextClient } = useClient()
   const { toast } = useToast()
   const [clients, setClients] = useState<Client[]>([])
@@ -28,8 +28,18 @@ export function ClientManagement() {
   const [clientToDelete, setClientToDelete] = useState<Client | null>(null)
   const [loading, setLoading] = useState(true)
 
+  // Redirect to login when auth is resolved and no user
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.push("/login")
+    }
+  }, [authLoading, user, router])
+
   const fetchClients = async () => {
-    if (!user?.id) return
+    if (!user?.id) {
+      setLoading(false)
+      return
+    }
 
     setLoading(true)
     try {

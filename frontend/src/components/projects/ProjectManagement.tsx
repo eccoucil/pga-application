@@ -209,8 +209,8 @@ export function ProjectManagement() {
 
   const stats = {
     total: projects.length,
-    planning: projects.filter((p) => p.status === "planning").length,
-    inProgress: projects.filter((p) => p.status === "in-progress").length,
+    started: projects.filter((p) => p.status === "started").length,
+    onGoing: projects.filter((p) => p.status === "on-going").length,
     completed: projects.filter((p) => p.status === "completed").length,
   }
 
@@ -262,8 +262,8 @@ export function ProjectManagement() {
 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-6">
         <StatusCard label="Total Projects" value={loading ? 0 : stats.total} color="cyan" />
-        <StatusCard label="Planning" value={loading ? 0 : stats.planning} color="orange" />
-        <StatusCard label="In Progress" value={loading ? 0 : stats.inProgress} color="blue" />
+        <StatusCard label="Started" value={loading ? 0 : stats.started} color="orange" />
+        <StatusCard label="On-going" value={loading ? 0 : stats.onGoing} color="blue" />
         <StatusCard label="Completed" value={loading ? 0 : stats.completed} color="green" />
       </div>
 

@@ -1,49 +1,81 @@
-export type QuestionScope = 'framework_overview' | 'section_deep_dive'
-export type QuestionStyle = 'control_specific' | 'practice_based' | 'evidence_focused' | 'maturity_assessment'
-export type QuestionType = 'policy' | 'implementation' | 'evidence'
+/**
+ * Questionnaire agent types matching the backend models in
+ * backend/app/models/questionnaire.py
+ */
 
+/** Returned when the agent wants to ask the user something. */
+export interface AgentQuestion {
+  session_id: string;
+  type: "question";
+  question: string;
+  context?: string | null;
+  options?: string[] | null;
+}
+
+/** A single generated compliance question. */
 export interface GeneratedQuestion {
-  question_number: number
-  question_text: string
-  question_type: QuestionType
-  expected_evidence: string
+  id: string;
+  question: string;
+  category: string;
+  priority: string;
+  expected_evidence?: string | null;
+  guidance_notes?: string | null;
 }
 
-export interface FrameworkQuestion {
-  id: string
-  project_id: string
-  framework: string
-  control_id: string | null
-  control_title: string | null
-  section_id: string | null
-  section_title: string | null
-  question_scope: QuestionScope | null
-  question_style: QuestionStyle | null
-  questions: GeneratedQuestion[]
-  referenced_controls: string[]
-  grounding_source: string | null
-  generated_at: string
+/** Questions generated for one framework control. */
+export interface ControlQuestions {
+  control_id: string;
+  control_title: string;
+  framework: string;
+  questions: GeneratedQuestion[];
 }
 
-export interface SectionGroup {
-  section_id: string
-  section_title: string
-  framework: string
-  question_scope: QuestionScope | null
-  questions: FrameworkQuestion[]
+/** Returned when the agent finishes generating all questions. */
+export interface QuestionnaireComplete {
+  session_id: string;
+  type: "complete";
+  controls: ControlQuestions[];
+  total_controls: number;
+  total_questions: number;
+  generation_time_ms: number;
+  criteria_summary: string;
 }
 
-export interface ControlItem {
-  control_id: string
-  control_title: string
-  framework: string
-  question_scope: QuestionScope | null
-  frameworkQuestion: FrameworkQuestion
+/** Discriminated union — narrows on `type` field. */
+export type QuestionnaireResponse = AgentQuestion | QuestionnaireComplete;
+
+/** Structured criteria for the wizard flow (batch generation). */
+export interface GenerateWithCriteriaRequest {
+  project_id: string;
+  assessment_id?: string | null;
+  maturity_level: "first_time_audit" | "recurring_assessment" | "mature_isms";
+  question_depth: "high_level_overview" | "balanced" | "detailed_technical";
+  priority_domains: string[];
+  compliance_concerns?: string | null;
+  controls_to_skip?: string | null;
 }
 
-export interface SectionWithControls {
-  section_id: string
-  section_title: string
-  framework: string
-  controls: ControlItem[]
+/** Summary row from GET /questionnaire/sessions. */
+export interface QuestionnaireSessionSummary {
+  id: string;
+  status: string;
+  total_questions: number;
+  total_controls: number;
+  created_at: string;
+  assessment_id: string | null;
+}
+
+/** Full session row from GET /questionnaire/sessions/:id. */
+export interface QuestionnaireSessionDetail {
+  id: string;
+  project_id: string;
+  client_id: string;
+  status: string;
+  assessment_id: string | null;
+  generated_questions: ControlQuestions[];
+  total_controls: number;
+  total_questions: number;
+  generation_time_ms: number;
+  agent_criteria: { summary: string };
+  created_at: string;
 }

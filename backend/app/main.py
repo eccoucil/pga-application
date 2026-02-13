@@ -6,9 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import assessment, framework, framework_docs, knowledge, questions, search
-from app.services.neo4j_service import get_neo4j_service
-from app.services.qdrant_service import get_qdrant_service
+from app.routers import assessment, framework, framework_docs, questionnaire
 
 # Configure logging
 logging.basicConfig(
@@ -21,44 +19,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle - startup and shutdown."""
-    # Startup: Initialize database connections
     logger.info("Starting PGA Backend...")
-
-    try:
-        neo4j = get_neo4j_service()
-        await neo4j.initialize()
-        logger.info("Neo4j connection initialized")
-    except Exception as e:
-        logger.warning(f"Neo4j initialization failed (service may be unavailable): {e}")
-
-    try:
-        qdrant = get_qdrant_service()
-        await qdrant.initialize()
-        logger.info("Qdrant connection initialized")
-    except Exception as e:
-        logger.warning(
-            f"Qdrant initialization failed (service may be unavailable): {e}"
-        )
-
     logger.info("PGA Backend started successfully")
 
     yield
 
-    # Shutdown: Close database connections
     logger.info("Shutting down PGA Backend...")
-
-    try:
-        neo4j = get_neo4j_service()
-        await neo4j.close()
-    except Exception as e:
-        logger.warning(f"Error closing Neo4j connection: {e}")
-
-    try:
-        qdrant = get_qdrant_service()
-        await qdrant.close()
-    except Exception as e:
-        logger.warning(f"Error closing Qdrant connection: {e}")
-
     logger.info("PGA Backend shutdown complete")
 
 
@@ -69,10 +35,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS for frontend
+# CORS for frontend (configurable via CORS_ORIGINS env var, comma-separated)
+from app.config import get_settings
+
+_settings = get_settings()
+_cors_origins = [origin.strip() for origin in _settings.cors_origins.split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3001"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,10 +51,8 @@ app.add_middleware(
 # Include routers
 app.include_router(assessment.router)
 app.include_router(framework.router)
-app.include_router(knowledge.router)
-app.include_router(questions.router)
-app.include_router(search.router)
 app.include_router(framework_docs.router)
+app.include_router(questionnaire.router)
 
 
 @app.get("/health")
@@ -92,32 +60,20 @@ async def health_check() -> dict:
     """
     Health check endpoint for monitoring.
 
-    Returns overall health status and status of each service:
-    - neo4j: Knowledge graph database
-    - qdrant: Vector search database
+    Returns overall health status and Supabase connectivity.
     """
     health = {"status": "healthy", "services": {}}
 
-    # Check Neo4j
+    # Check Supabase
     try:
-        neo4j = get_neo4j_service()
-        neo4j_health = await neo4j.health_check()
-        health["services"]["neo4j"] = neo4j_health
-    except Exception as e:
-        health["services"]["neo4j"] = {"status": "unavailable", "error": str(e)}
+        from app.db.supabase import get_async_supabase_client_async
 
-    # Check Qdrant
-    try:
-        qdrant = get_qdrant_service()
-        qdrant_health = await qdrant.health_check()
-        health["services"]["qdrant"] = qdrant_health
+        sb = await get_async_supabase_client_async()
+        # Simple connectivity check
+        await sb.table("clients").select("id", count="exact").limit(0).execute()
+        health["services"]["supabase"] = {"status": "healthy"}
     except Exception as e:
-        health["services"]["qdrant"] = {"status": "unavailable", "error": str(e)}
-
-    # Overall status is degraded if any service is unhealthy
-    for service_name, service_health in health["services"].items():
-        if service_health.get("status") not in ("healthy", None):
-            health["status"] = "degraded"
-            break
+        health["services"]["supabase"] = {"status": "unavailable", "error": str(e)}
+        health["status"] = "degraded"
 
     return health

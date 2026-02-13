@@ -56,7 +56,6 @@ def _make_agent(
 ) -> WebCrawlerAgent:
     """Build a WebCrawlerAgent with fully mocked sub-agents."""
     mock_anthropic = MagicMock()
-    mock_neo4j = MagicMock()
     mock_supabase = MagicMock()
 
     # Mock crawl coordinator
@@ -92,7 +91,6 @@ def _make_agent(
         )
         agent = WebCrawlerAgent(
             anthropic_client=mock_anthropic,
-            neo4j_service=mock_neo4j,
             supabase_client=mock_supabase,
             crawl_coordinator=crawl_coordinator,
             business_analyzer=business_analyzer,
@@ -168,7 +166,7 @@ class TestWebCrawlerAgent:
         assert result.pages_crawled == 1
 
     async def test_storage_errors_recorded(self):
-        """Storage failures are appended to errors, not raised."""
+        """Supabase storage failure is recorded; Neo4j failure is non-critical."""
         agent = _make_agent(pages=[_make_page()])
         agent.storage.store_in_neo4j = AsyncMock(
             side_effect=RuntimeError("Neo4j down")
@@ -180,7 +178,9 @@ class TestWebCrawlerAgent:
         result = await agent.crawl_domain(_make_request(), "user-1")
 
         assert result.success is False
-        assert any("Graph storage" in e for e in result.errors)
+        # Neo4j failure is a warning, not an error — should NOT be in errors
+        assert not any("Graph storage" in e for e in result.errors)
+        # Supabase failure IS critical
         assert any("Database storage" in e for e in result.errors)
 
     async def test_processing_time_recorded(self):
