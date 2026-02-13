@@ -71,6 +71,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       password,
       options: {
         data: profileData, // Stored in auth.users.user_metadata
+        emailRedirectTo: `${window.location.origin}/login`,
       },
     })
 
