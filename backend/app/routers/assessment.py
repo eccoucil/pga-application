@@ -269,10 +269,11 @@ async def get_findings_for_project(
     ]
     context_nodes_created = ["Organization"]
 
-    industry = client.get("industry") or "Other"
-    if industry:
+    industry_raw = client.get("industry")
+    industry = industry_raw or "Other"
+    if industry_raw:
         context_nodes.append(
-            Neo4jNodeReference(node_id=str(uuid.uuid4()), node_type="Industry", name=industry)
+            Neo4jNodeReference(node_id=str(uuid.uuid4()), node_type="Industry", name=industry_raw)
         )
         context_nodes_created.append("Industry")
 

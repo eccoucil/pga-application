@@ -7,13 +7,11 @@ WORKDIR /app
 
 # Install deps first (cached unless pyproject.toml/uv.lock change)
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Then copy project source and install it
 COPY . .
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev
 
 # ============================================================
 # Stage 2: Dev — hot-reload with volume mounts

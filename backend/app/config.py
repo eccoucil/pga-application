@@ -22,6 +22,15 @@ class Settings(BaseSettings):
     anthropic_api_key: Optional[str] = None
     claude_model: str = "claude-sonnet-4-20250514"
 
+    # Neo4j (optional - knowledge graph)
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: Optional[str] = None
+
+    # Qdrant (optional - vector search)
+    qdrant_host: str = "localhost"
+    qdrant_port: int = 6333
+
     # CRAWL4AI web crawler settings
     crawl4ai_max_pages: int = 50
     crawl4ai_timeout: int = 300  # 5 minutes
