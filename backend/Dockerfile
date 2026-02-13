@@ -56,7 +56,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
 # Install Playwright Chromium browser binary
-RUN playwright install chromium
+RUN /app/.venv/bin/playwright install chromium
 
 # Non-root user for production
 RUN useradd --create-home appuser
