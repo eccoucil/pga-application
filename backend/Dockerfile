@@ -43,7 +43,7 @@ CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port $PORT --reload"]
 # ============================================================
 # Stage 3: Production — minimal runtime image
 # ============================================================
-FROM mcr.microsoft.com/playwright/python:v1.57.0-noble AS production
+FROM python:3.11-slim-bookworm AS production
 
 WORKDIR /app
 
@@ -55,8 +55,8 @@ COPY --from=builder /app/app ./app
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
-# Install Playwright Chromium browser binary
-RUN /app/.venv/bin/playwright install chromium
+# Install Chromium + OS dependencies (libnss3, libatk, fonts, etc.)
+RUN playwright install --with-deps chromium
 
 # Non-root user for production
 RUN useradd --create-home appuser
