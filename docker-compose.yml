@@ -12,8 +12,9 @@ services:
       target: production
     container_name: pga-backend
     ports:
-      - "${BACKEND_PORT:-8001}:8001"
+      - "${BACKEND_PORT:-8001}:${BACKEND_PORT:-8001}"
     environment:
+      - PORT=${BACKEND_PORT:-8001}
       # Supabase
       - SUPABASE_URL=${SUPABASE_URL}
       - SUPABASE_KEY=${SUPABASE_KEY}
@@ -33,6 +34,7 @@ services:
       args:
         - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
         - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+        - NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY:-}
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8001}
     container_name: pga-frontend
     ports:
@@ -52,7 +54,7 @@ services:
     container_name: pga-backend-dev
     profiles: ["dev"]
     ports:
-      - "${BACKEND_PORT:-8001}:8001"
+      - "${BACKEND_PORT:-8001}:${BACKEND_PORT:-8001}"
     volumes:
       - ./backend/app:/app/app
     environment:
@@ -61,6 +63,7 @@ services:
       - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - PORT=${BACKEND_PORT:-8001}
       - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY:-}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3001}
     networks:
