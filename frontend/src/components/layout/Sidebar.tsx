@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { LayoutDashboard, Users, Briefcase, Settings, Sun, Moon, ChevronDown, ShieldCheck, FolderKanban, BookOpen, ScrollText, Landmark } from "lucide-react"
+import { Users, Briefcase, Sun, Moon, ChevronDown, ShieldCheck, Landmark } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useClient } from "@/contexts/ClientContext"
 import { useProject } from "@/contexts/ProjectContext"
@@ -30,14 +30,9 @@ export function Sidebar() {
     ...(selectedClient && selectedProject?.framework?.includes("ISO 27001:2022")
       ? [
           {
-            icon: BookOpen,
-            label: "Annex A",
-            href: `/clients/${selectedClient.id}/projects/${selectedProject.id}/annex-a`,
-          },
-          {
-            icon: ScrollText,
-            label: "Management Clauses",
-            href: `/clients/${selectedClient.id}/projects/${selectedProject.id}/management-clauses`,
+            icon: ShieldCheck,
+            label: "Controls",
+            href: `/clients/${selectedClient.id}/projects/${selectedProject.id}/controls`,
           },
         ]
       : []),
