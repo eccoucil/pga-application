@@ -161,11 +161,6 @@ npm run dev -- -p 3001
 - `GET /knowledge/gaps` - Get identified compliance gaps
 - `GET /knowledge/graph` - Get policy relationship graph
 
-### Questionnaire
-- `POST /questionnaire/generate` - Generate compliance assessment questions
-- `GET /questionnaire/{project_id}` - Get questions for a project
-- `POST /questionnaire/responses` - Submit question responses
-
 ### Assessment
 - `POST /assessment/submit` - Submit assessment (multipart/form-data)
   - Required: `client_id`, `project_id`, `organization_name`, `nature_of_business` (min 10 chars), `industry_type`, `department`, `scope_statement_isms` (min 10 chars)

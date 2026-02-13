@@ -24,6 +24,15 @@ cd backend && docker-compose up -d
 # Backend tests
 cd backend && uv run pytest
 
+# Single backend test file
+cd backend && uv run pytest tests/test_assessment.py -v
+
+# Single test function
+cd backend && uv run pytest tests/test_assessment.py::test_health_check -v
+
+# Install dev dependencies (required before running tests)
+cd backend && uv sync --extra dev
+
 # Backend linting
 cd backend && uv run ruff format . && uv run ruff check --fix .
 
@@ -33,27 +42,37 @@ cd frontend && npm run lint
 
 ## Architecture
 
-### Backend Configuration (`backend/app/`)
+### Backend Stack
 
-- **config.py** - Pydantic settings management (loads from `.env`)
-- **auth/dependencies.py** - Supabase JWT validation via `get_current_user` dependency
+- **FastAPI** with `asynccontextmanager` lifespan (not deprecated `on_event`)
+- **Supabase** (PostgreSQL + Auth + RLS) — backend uses **service key** (bypasses RLS)
+- **Qdrant** — vector DB, collection `"pga_documents"`, 1536-dim cosine (matches `text-embedding-3-small`)
+- **Neo4j** 5.15 with APOC — graph DB for organization/asset relationships
+- **uv** as package manager (not pip): `uv run <command>`, `uv sync`
+
+### Backend Key Files
+
+- **config.py** — Pydantic settings management (loads from `.env`)
+- **auth/dependencies.py** — Supabase JWT validation (`get_current_user` dependency). Supports both ES256 (JWKS) and HS256 (legacy). Returns `{"user_id", "email", "role"}`.
+- **db/supabase.py** — Database client creation (see Gotchas below)
 
 ### Backend Services (`backend/app/services/`)
 
-- **neo4j_service.py** - Graph database operations (Company, DigitalAsset, Policy, Document nodes)
-- **qdrant_service.py** - Vector database operations for semantic search
-- **embedding_service.py** - OpenAI text embeddings (text-embedding-3-small)
-- **assessment_orchestrator.py** - Lightweight coordination agent (no LLM, pure Python orchestration)
-- **web_crawler_agent.py** - CRAWL4AI-powered web intelligence extraction with Claude Opus 4.5 sub-agents
+- **assessment_orchestrator.py** — Lightweight coordination (no LLM, pure Python). Receives multipart submissions, runs document processing + web crawling in parallel via `asyncio.gather()`. 5-minute timeout.
+- **questionnaire_agent.py** — Conversational Claude agent using `tool_use` interview loop with two tools: `askQuestionToMe` (ask user) and `generateQuestionnaire` (trigger batch generation). Processes controls in batches of 15.
+- **web_crawler_agent.py** / `app/services/web_crawler/` — CRAWL4AI web intelligence extraction with parallel sub-agents. Refactored into a package with `BaseLLMExtractor` ABC template method pattern.
+- **neo4j_service.py** — Graph operations (Company, DigitalAsset, Policy, Document nodes)
+- **qdrant_service.py** — Vector search. Uses `AsyncQdrantClient` with `query_points` (not `search`).
+- **embedding_service.py** — OpenAI `text-embedding-3-small` embeddings
 
-### Backend Routers (`backend/app/routers/`)
+### Assessment Flow (data pipeline)
 
-- **assessment.py** - Assessment submission and status endpoints (multipart/form-data)
-- **knowledge.py** - Knowledge graph endpoints
-- **search.py** - Semantic search endpoints
-- **web_crawler.py** - Web crawling endpoints (crawl domain, list/get/delete results, asset graph)
-
-**Note:** `client_members.py` router is referenced in frontend but not yet implemented.
+1. **Router** (`POST /assessment/submit`): Accepts `multipart/form-data` (NOT JSON). Flat form fields + optional file uploads.
+2. **Orchestrator**: Creates Organization node in Neo4j first, then runs in parallel:
+   - Document processing (LlamaExtract if `LLAMA_CLOUD_API_KEY` set, else `DocumentTextExtractor` fallback for PDF/DOCX/XLSX/CSV/TXT)
+   - Web crawling (only if `web_domain` provided)
+3. **Persistence**: Best-effort — catches exceptions and logs warnings rather than failing the request.
+4. **Knowledge graph**: Builds React Flow-compatible graph with radial layout (center=Organization, radius=250).
 
 ### Assessment Payload (`POST /assessment/submit`)
 
@@ -69,103 +88,113 @@ cd frontend && npm run lint
 | `web_domain` | string | No | Domain format if provided |
 | `documents` | File[] | No | PDF, DOCX, TXT, XLSX, CSV |
 
+### Questionnaire Conversational Flow
+
+Two generation paths:
+
+1. **Conversational** (`POST /questionnaire/generate-question` → `POST /questionnaire/respond` loop): Claude uses `askQuestionToMe` tool to ask clarifying questions. User answers are wrapped as `tool_result` messages. When Claude calls `generateQuestionnaire`, batch generation starts.
+
+2. **Wizard/batch** (`POST /questionnaire/generate-with-criteria`): All criteria provided upfront, skips conversation.
+
+Context fetching is two-phase parallel: (project + findings + crawl results) then (client info + framework controls conditional on selected frameworks). Neo4j and Qdrant context are optional/non-blocking.
+
+### Frontend Stack
+
+- **Next.js 15** with App Router, **React 19**, **TypeScript** (strict mode)
+- **Tailwind CSS 4** with `@tailwindcss/postcss`
+- **@xyflow/react** v12 for knowledge graph visualization
+- **Radix UI** primitives (dialog, select, checkbox, dropdown, popover, toast)
+- **lucide-react** for icons (primary icon library)
+- Path alias: `@/*` → `./src/*`
+
 ### Frontend State Management
 
-Five React contexts manage application state:
-- `ThemeContext` - Dark/light mode theme management (persists to localStorage)
-- `AuthContext` - Supabase authentication
-- `ClientContext` - Selected client (clears project on change)
-- `ProjectContext` - Selected project (auto-clears when client changes)
-- `ClientMembershipContext` - Team membership, roles (owner/admin/member/viewer), and permissions
+Five React contexts, nested in this order (order matters for dependencies):
 
-### Frontend Layout Components (`frontend/src/components/layout/`)
+```
+ThemeProvider
+  AuthProvider
+    ClientProvider              ← auto-clears when navigating away from /clients/...
+      ClientMembershipProvider  ← depends on AuthContext + ClientContext
+        ProjectProvider         ← auto-clears when URL doesn't match /clients/[id]/projects/[projectId]
+```
 
-- **DashboardLayout** - Main layout wrapper with Header, Sidebar, and Footer
-- **Header** - Fixed top header with Organization Portal branding and dark mode toggle
-- **Sidebar** - Collapsible icon rail that expands on hover (16px collapsed, 56px expanded)
-  - Shows icons when collapsed, full labels when expanded
-  - Single "Clients" menu item linking to `/clients`
-- **Footer** - Fixed bottom footer with copyright and links
+Permissions are calculated client-side from role: `viewer` (view only) → `member` (+write) → `admin` (+manage) → `owner` (all).
 
-### Frontend Client Management (`frontend/src/components/clients/`)
+### Frontend API Patterns
 
-- **ClientManagement** - Main component with stats cards, search/filter, and CRUD operations
-- **ClientTable** - Table component displaying clients with proper field mapping (`name` = company name, `company` = contact person)
-- **ClientModal** - Modal for creating/editing clients with validation
-- **DeleteConfirmation** - Confirmation dialog for client deletion
-- **CreateClientDialog** - Dialog component for creating new clients
-- **EditClientDialog** - Dialog component for editing existing clients
-
-### Frontend Web Crawler Components (`frontend/src/components/web-crawler/`)
-
-- **CrawlResultCard** - Displays individual crawl results with expandable details
-- **CrawlingProgressDialog** - Shows crawl progress with status updates
-- **BusinessContextSection** - Displays extracted business context (industry, services)
-- **DigitalAssetsSection** - Lists discovered digital assets (subdomains, portals, APIs)
-- **OrganizationInfoSection** - Shows organization info (contacts, certifications)
-- **AssetGraphSection** - Visual graph representation of discovered assets
-
-**Backend:** Implemented via `web_crawler.py` router with CRAWL4AI + Claude Opus 4.5.
+- **Supabase direct**: `frontend/src/lib/supabase.ts` is a ~300-line data access layer with CRUD functions for clients, projects, profiles. Uses `client_members!inner` join for multi-tenant visibility.
+- **Backend API**: No centralized API client. Each feature uses raw `fetch()` with `Authorization: Bearer` headers from `supabase.auth.getSession()`. See `use-questionnaire-agent.ts` as the pattern.
 
 ### Frontend Routes
 
-- `/` - Dashboard/home page
-- `/clients` - Client management page (uses ClientManagement component)
-- `/organizations` - Organizations page (alternative client management view)
-- `/clients/[id]/projects/[projectId]/assessment` - Assessment submission page
-- `/clients/[id]/projects/[projectId]/{documents|framework|questionnaires|web-crawl}` - Project-specific routes
+- `/login` — Supabase email/password auth
+- `/clients` — Client management with CRUD
+- `/clients/[id]/projects` — Project listing
+- `/clients/[id]/projects/[projectId]/assessment` — Multi-step assessment (stepper UI)
+- `/clients/[id]/projects/[projectId]/findings` — Results with knowledge graph
+- `/clients/[id]/projects/[projectId]/annex-a` — ISO 27001 Annex A controls
+- `/clients/[id]/projects/[projectId]/management-clauses` — ISO 27001 management clauses
 
 ### Database Schema
 
 **Supabase tables** (with Row Level Security):
-- `clients` - Client organizations (fields: `name` = company name, `company` = contact person)
-- `projects` - Projects under clients
-- `client_members` - Multi-tenant client membership with roles (owner/admin/member/viewer)
-- `project_documents` - Document upload metadata
-- `framework_questions` - Generated questions with `batch_id` tracking
-- `question_responses` - User responses to framework questions
-- `gap_analysis_findings` - Analysis results with compliance levels
-- `web_crawl_results` - Web crawler results (business_context, digital_assets, organization_info as JSONB)
-- `iso_requirements`, `bnm_rmit_requirements` - Framework control definitions
-- `compliance_mapping` - Mapping between ISO and BNM RMIT requirements
+- `clients` — Client organizations (**Note**: `name` = company name, `company` = contact person)
+- `projects` — `framework` field is `string[] | null` (multi-framework)
+- `client_members` — Multi-tenant membership with roles (owner/admin/member/viewer)
+- `questionnaire_sessions` — Completed sessions persisted with `generated_questions`, `agent_criteria`, `conversation_history` as JSONB
+- `gap_analysis_findings`, `project_documents`, `web_crawl_results`
+- `iso_requirements`, `bnm_rmit_requirements`, `compliance_mapping`
 
-**Neo4j nodes**:
-- `Company` - Organization from web crawl (domain, name, industry)
-- `DigitalAsset` - URLs discovered (asset_type: subdomain/portal/api/application/website)
-- `Policy`, `Document` - Document analysis relationships
+**Neo4j nodes**: `Company`, `DigitalAsset` (with `HAS_ASSET` relationships), `Policy`, `Document`
 
-**Migrations** in `migrations/` - Run manually against Supabase SQL editor.
+**Migrations** in `migrations/` — Run manually against Supabase SQL editor.
 
 ## Key Patterns
 
-### Backend Package Manager
-Always use `uv` (not pip): `uv run <command>`, `uv sync`
-
 ### Compliance Levels
-- `compliant` - Policy explicitly addresses all control aspects
-- `partially_compliant` - Policy exists but has gaps
-- `non_compliant` - Policy contradicts requirements
-- `not_assessed` - Insufficient evidence
+- `compliant` — Policy explicitly addresses all control aspects
+- `partially_compliant` — Policy exists but has gaps
+- `non_compliant` — Policy contradicts requirements
+- `not_assessed` — Insufficient evidence
 
 ### Framework Identifiers
 - ISO 27001: `identifier` like "A.5.1", "A.8.34" (Annex A) or clauses 4-10 (management)
 - BNM RMIT: `reference_id` like "8.1", `section_number` for numeric sorting
 
 ### UI Styling
-
-**Theme Support:**
-- Light/dark mode toggle in header
-- Theme preference persisted in localStorage
-- Uses Tailwind `dark:` variants throughout
-
-**Custom Classes:**
-- `cyber-gradient-bg`, `cyber-grid-dark`, `glow-effect`, `text-glow`
+- Light/dark mode via `ThemeContext` (persists to localStorage), uses Tailwind `dark:` variants
+- Custom classes: `cyber-gradient-bg`, `cyber-grid-dark`, `glow-effect`, `text-glow`
 - Button variant: `cyber` (cyan gradient)
-
-**Layout Styling:**
 - Sidebar: Collapsible icon rail (16px collapsed, 56px expanded on hover)
-- Header/Footer: Fixed positioning with backdrop blur
-- Main content: Responsive padding and margins based on sidebar state
+
+### Testing
+- Auth mocking: `app.dependency_overrides[get_current_user] = mock_get_current_user` at module level
+- Use `reset_orchestrator()` in fixtures for test isolation
+- No `conftest.py` — each test file sets up its own mocks
+- Pre-existing failure in `test_assessment.py` (LlamaExtract conflict) — not a regression
+
+## Gotchas
+
+### Supabase Client — Two Async Functions
+- `get_async_supabase_client()` — uses `asyncio.run()`, **cannot be called from within an async context**. Will raise `RuntimeError`.
+- `get_async_supabase_client_async()` — the correct one for async endpoints. Always use this one.
+- Both use `supabase_service_key` (bypasses RLS). Sync `get_supabase_client()` also exists for specific sync paths.
+
+### In-Memory State
+Both the orchestrator (`active_assessments` dict) and questionnaire agent (`_sessions` dict) store state in memory. **Server restarts lose all active sessions.** Completed questionnaire sessions are persisted to Supabase, active conversations are not.
+
+### CORS
+Hardcoded to `http://localhost:3001` in `main.py`. No env-var override — must edit code for different frontend origins.
+
+### Graceful Degradation
+The app starts even if Neo4j/Qdrant Docker services are down. `GET /health` returns `"degraded"` status. Services that depend on them will fail at call time, not at startup.
+
+### Assessment Endpoint is Form-Data
+`POST /assessment/submit` uses `Form(...)` and `File(...)` parameters, NOT a JSON body. Frontend must send `multipart/form-data`.
+
+### Questionnaire Agent HTTP Client
+Forces HTTP/1.1 (`http2=False`) to avoid Mac connection issues. Custom timeout: 600s total (30s connect, 570s read). Retries on `RateLimitError`/`APITimeoutError` with exponential backoff (3 attempts).
 
 ## Service URLs (Development)
 
@@ -200,4 +229,3 @@ NEXT_PUBLIC_SUPABASE_URL
 NEXT_PUBLIC_SUPABASE_ANON_KEY (or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY)
 NEXT_PUBLIC_API_URL=http://localhost:8001
 ```
-
