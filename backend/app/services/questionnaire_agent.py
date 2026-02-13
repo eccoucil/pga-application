@@ -535,6 +535,8 @@ Ensure questions are specific to {org_name}'s context."""
         """
         session = _sessions.get(session_id)
         if session is None:
+            session = await self._load_session_from_db(session_id)
+        if session is None:
             raise ValueError(f"Session {session_id} not found or expired")
         if session.status != "active":
             raise ValueError(f"Session {session_id} is already {session.status}")
@@ -1060,6 +1062,9 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             if tool_block and tool_block.name == "askQuestionToMe":
                 session.pending_tool_use_id = tool_block.id
 
+                # Persist active state so session survives restarts
+                await self._persist_active_session(session)
+
                 return AgentQuestion(
                     session_id=session.session_id,
                     question=tool_block.input.get("question", ""),
@@ -1086,8 +1091,9 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             # end_turn — agent is done, extract generated questions
             return await self._handle_completion(session, response)
         
-        # Fallback: if it's just text, treat it as a question to the user 
+        # Fallback: if it's just text, treat it as a question to the user
         # but without tool metadata (manual fallback)
+        await self._persist_active_session(session)
         return AgentQuestion(
             session_id=session.session_id,
             question=text.strip() or "I need more information to generate the questions. Could you please clarify your requirements?",
@@ -1435,6 +1441,136 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             logger.warning(f"Cache lookup failed for assessment {assessment_id}: {e}")
             return None
 
+    @staticmethod
+    def _serialize_messages(messages: list[dict]) -> list[dict]:
+        """Serialize conversation messages for JSONB storage.
+
+        Handles Anthropic content blocks (which have ``.model_dump()``) as well
+        as plain dicts and strings.
+        """
+        conversation: list[dict] = []
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                serialized = []
+                for block in content:
+                    if hasattr(block, "model_dump"):
+                        serialized.append(block.model_dump())
+                    elif isinstance(block, dict):
+                        serialized.append(block)
+                    else:
+                        serialized.append(str(block))
+                conversation.append(
+                    {"role": msg["role"], "content": serialized}
+                )
+            else:
+                conversation.append(msg)
+        return conversation
+
+    # ------------------------------------------------------------------
+    # Active session persistence (survives restarts)
+    # ------------------------------------------------------------------
+
+    async def _persist_active_session(
+        self, session: QuestionnaireSession
+    ) -> None:
+        """Upsert the active session state to Supabase so it survives restarts."""
+        try:
+            from app.db.supabase import get_async_supabase_client_async
+
+            sb = await get_async_supabase_client_async()
+            conversation = self._serialize_messages(session.messages)
+
+            row: dict[str, Any] = {
+                "id": session.session_id,
+                "project_id": session.project_id,
+                "client_id": session.client_id,
+                "user_id": session.user_id,
+                "status": "active",
+                "conversation_history": conversation,
+                "pending_tool_use_id": session.pending_tool_use_id,
+                "started_at_ms": session.started_at_ms,
+                "model_used": self._model,
+                "created_by": session.user_id,
+            }
+            if session.assessment_id:
+                row["assessment_id"] = session.assessment_id
+
+            await sb.table("questionnaire_sessions").upsert(row).execute()
+
+            logger.debug(
+                f"Session {session.session_id}: persisted active state "
+                f"({len(session.messages)} messages)"
+            )
+        except Exception as e:
+            logger.error(
+                f"Session {session.session_id}: failed to persist active state: {e}"
+            )
+
+    async def _load_session_from_db(
+        self, session_id: str
+    ) -> QuestionnaireSession | None:
+        """Load an active session from DB when not found in memory.
+
+        This is the key method that enables session recovery after a backend
+        restart.  It re-fetches project context, rebuilds the system prompt,
+        and deserializes the conversation history.
+        """
+        try:
+            from app.db.supabase import get_async_supabase_client_async
+
+            sb = await get_async_supabase_client_async()
+            result = (
+                await sb.table("questionnaire_sessions")
+                .select("*")
+                .eq("id", session_id)
+                .eq("status", "active")
+                .limit(1)
+                .execute()
+            )
+
+            if not result.data:
+                return None
+
+            row = result.data[0]
+            project_id = row["project_id"]
+
+            # Re-fetch context and rebuild system prompt (not stored in DB)
+            context = await self._fetch_project_context(project_id)
+            system_prompt = self._build_system_prompt(context)
+
+            messages = row.get("conversation_history") or []
+
+            session = QuestionnaireSession(
+                session_id=session_id,
+                project_id=project_id,
+                client_id=row["client_id"],
+                user_id=row["user_id"],
+                assessment_id=row.get("assessment_id"),
+                messages=messages,
+                pending_tool_use_id=row.get("pending_tool_use_id"),
+                project_context=context,
+                system_prompt=system_prompt,
+                started_at_ms=row.get("started_at_ms") or 0,
+                status="active",
+            )
+
+            # Re-cache in memory
+            _sessions[session_id] = session
+            logger.info(
+                f"Session {session_id}: restored from DB "
+                f"({len(messages)} messages)"
+            )
+            return session
+
+        except Exception as e:
+            logger.error(f"Failed to load session {session_id} from DB: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Completed session persistence
+    # ------------------------------------------------------------------
+
     async def _persist_results(
         self,
         session: QuestionnaireSession,
@@ -1449,30 +1585,10 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
 
             sb = await get_async_supabase_client_async()
 
-            # Serialize controls for JSONB
             controls_json = [c.model_dump() for c in controls]
+            conversation = self._serialize_messages(session.messages)
 
-            # Serialize conversation (strip non-serializable content blocks)
-            conversation = []
-            for msg in session.messages:
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    # Convert Anthropic content blocks to dicts
-                    serialized = []
-                    for block in content:
-                        if hasattr(block, "model_dump"):
-                            serialized.append(block.model_dump())
-                        elif isinstance(block, dict):
-                            serialized.append(block)
-                        else:
-                            serialized.append(str(block))
-                    conversation.append(
-                        {"role": msg["role"], "content": serialized}
-                    )
-                else:
-                    conversation.append(msg)
-
-            row = {
+            row: dict[str, Any] = {
                 "id": session.session_id,
                 "project_id": session.project_id,
                 "client_id": session.client_id,
@@ -1487,11 +1603,13 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
                 "generation_time_ms": elapsed_ms,
                 "completed_at": datetime.utcnow().isoformat(),
                 "created_by": session.user_id,
+                "pending_tool_use_id": None,
             }
             if session.assessment_id:
                 row["assessment_id"] = session.assessment_id
 
-            await sb.table("questionnaire_sessions").insert(row).execute()
+            # Use upsert: the row may already exist from active session persistence
+            await sb.table("questionnaire_sessions").upsert(row).execute()
 
             logger.info(
                 f"Session {session.session_id}: persisted {total_questions} "
