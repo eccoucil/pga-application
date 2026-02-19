@@ -1,8 +1,8 @@
 "use client"
 
 import Link from "next/link"
-import { usePathname } from "next/navigation"
-import { Users, Briefcase, Sun, Moon, ChevronDown, ShieldCheck, Landmark } from "lucide-react"
+import { usePathname, useRouter } from "next/navigation"
+import { Users, Briefcase, Sun, Moon, ChevronDown, ShieldCheck, Landmark, LogOut } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useClient } from "@/contexts/ClientContext"
 import { useProject } from "@/contexts/ProjectContext"
@@ -13,8 +13,9 @@ export function Sidebar() {
   const pathname = usePathname()
   const { selectedClient } = useClient()
   const { selectedProject } = useProject()
+  const router = useRouter()
   const { darkMode, toggleDarkMode, mounted } = useTheme()
-  const { user } = useAuth()
+  const { user, signOut } = useAuth()
 
   const menuItems = [
     { icon: Users, label: "Clients", href: "/clients" },
@@ -140,21 +141,33 @@ export function Sidebar() {
               <p className="text-white font-medium truncate max-w-[120px]">{getUserName()}</p>
             </div>
           </div>
-          <button
-            onClick={toggleDarkMode}
-            className="p-2 hover:bg-white/5 rounded-full text-slate-400 hover:text-white transition-colors"
-            aria-label="Toggle dark mode"
-          >
-            {mounted ? (
-              darkMode ? (
-                <Sun className="w-4 h-4" />
+          <div className="flex items-center gap-1">
+            <button
+              onClick={toggleDarkMode}
+              className="p-2 hover:bg-white/5 rounded-full text-slate-400 hover:text-white transition-colors"
+              aria-label="Toggle dark mode"
+            >
+              {mounted ? (
+                darkMode ? (
+                  <Sun className="w-4 h-4" />
+                ) : (
+                  <Moon className="w-4 h-4" />
+                )
               ) : (
-                <Moon className="w-4 h-4" />
-              )
-            ) : (
-              <div className="w-4 h-4" />
-            )}
-          </button>
+                <div className="w-4 h-4" />
+              )}
+            </button>
+            <button
+              onClick={async () => {
+                await signOut()
+                router.push("/login")
+              }}
+              className="p-2 hover:bg-white/5 rounded-full text-slate-400 hover:text-red-400 transition-colors"
+              aria-label="Sign out"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          </div>
         </div>
       </div>
     </div>

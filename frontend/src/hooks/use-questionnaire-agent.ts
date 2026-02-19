@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import type {
   AgentQuestion,
+  GenerateWithCriteriaRequest,
   QuestionnaireComplete,
   QuestionnaireResponse,
 } from "@/types/questionnaire";
@@ -25,13 +26,24 @@ export interface QAEntry {
   answer: string;
 }
 
+export interface GenerationProgress {
+  batch: number;
+  total: number;
+  controlsDone: number;
+  totalControls: number;
+}
+
 interface UseQuestionnaireAgentReturn {
   state: AgentState;
   currentQuestion: AgentQuestion | null;
   answeredQuestions: QAEntry[];
   result: QuestionnaireComplete | null;
   error: string | null;
+  progress: GenerationProgress | null;
   startSession: (projectId: string, assessmentId?: string) => Promise<void>;
+  generateWithCriteria: (
+    criteria: GenerateWithCriteriaRequest,
+  ) => Promise<void>;
   submitAnswer: (answer: string) => Promise<void>;
   retry: () => void;
   reset: () => void;
@@ -80,6 +92,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
   const [answeredQuestions, setAnsweredQuestions] = useState<QAEntry[]>([]);
   const [result, setResult] = useState<QuestionnaireComplete | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<GenerationProgress | null>(null);
 
   // Track the session_id returned by the agent
   const sessionIdRef = useRef<string | null>(null);
@@ -185,6 +198,86 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     [currentQuestion, handleResponse],
   );
 
+  const generateWithCriteria = useCallback(
+    async (criteria: GenerateWithCriteriaRequest) => {
+      setState("generating");
+      setError(null);
+      setResult(null);
+      setProgress(null);
+
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        const headers = await getAuthHeaders();
+        const res = await fetch(
+          `${API_URL}/questionnaire/generate-with-criteria-stream`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...headers },
+            body: JSON.stringify(criteria),
+            signal: controller.signal,
+          },
+        );
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(
+            err.detail || `Request failed: ${res.status}`,
+          );
+        }
+
+        const reader = res.body?.getReader();
+        if (!reader) throw new Error("No response stream");
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          // Keep incomplete last line in buffer
+          buffer = lines.pop() ?? "";
+
+          let currentEvent = "";
+          for (const line of lines) {
+            if (line.startsWith("event: ")) {
+              currentEvent = line.slice(7).trim();
+            } else if (line.startsWith("data: ")) {
+              const data = JSON.parse(line.slice(6));
+              if (currentEvent === "progress") {
+                setProgress({
+                  batch: data.batch,
+                  total: data.total,
+                  controlsDone: data.controls_done,
+                  totalControls: data.total_controls,
+                });
+              } else if (currentEvent === "complete") {
+                setResult(data);
+                setProgress(null);
+                setState("complete");
+              } else if (currentEvent === "error") {
+                throw new Error(data.error || "Generation failed");
+              }
+              currentEvent = "";
+            }
+          }
+        }
+      } catch (e) {
+        if (controller.signal.aborted) return;
+        setError(
+          e instanceof Error ? e.message : "Failed to generate questions",
+        );
+        setState("error");
+      }
+    },
+    [],
+  );
+
   const retry = useCallback(() => {
     if (paramsRef.current) {
       startSession(
@@ -201,6 +294,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     setAnsweredQuestions([]);
     setResult(null);
     setError(null);
+    setProgress(null);
     sessionIdRef.current = null;
   }, []);
 
@@ -210,7 +304,9 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     answeredQuestions,
     result,
     error,
+    progress,
     startSession,
+    generateWithCriteria,
     submitAnswer,
     retry,
     reset,

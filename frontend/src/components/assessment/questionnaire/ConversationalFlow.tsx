@@ -25,6 +25,7 @@ export function ConversationalFlow({
     answeredQuestions,
     result,
     error,
+    progress,
     startSession,
     submitAnswer,
     retry,
@@ -95,13 +96,32 @@ export function ConversationalFlow({
 
         {/* Generating state (between questions or final generation) */}
         {state === "generating" && (
-          <div className="flex items-center justify-center py-8 text-slate-400 gap-3">
-            <Loader2 className="h-5 w-5 animate-spin text-purple-400" />
-            <span className="text-sm">
-              {answeredQuestions.length < 2
-                ? "Processing your response..."
-                : "Generating tailored compliance questions..."}
-            </span>
+          <div className="py-8 space-y-4">
+            <div className="flex items-center justify-center text-slate-400 gap-3">
+              <Loader2 className="h-5 w-5 animate-spin text-purple-400" />
+              <span className="text-sm">
+                {!progress
+                  ? answeredQuestions.length < 2
+                    ? "Processing your response..."
+                    : "Generating tailored compliance questions..."
+                  : `Generating questions... Batch ${progress.batch}/${progress.total} (${progress.controlsDone} controls processed)`}
+              </span>
+            </div>
+            {progress && progress.total > 0 && (
+              <div className="mx-auto max-w-md space-y-2">
+                <div className="h-2 bg-white/5 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-purple-500 to-cyan-500 rounded-full transition-all duration-500 ease-out"
+                    style={{
+                      width: `${Math.round((progress.batch / progress.total) * 100)}%`,
+                    }}
+                  />
+                </div>
+                <p className="text-xs text-slate-500 text-center">
+                  {progress.controlsDone} / {progress.totalControls} controls
+                </p>
+              </div>
+            )}
           </div>
         )}
 

@@ -1,6 +1,7 @@
 """Questionnaire generation router — conversational agent endpoints."""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.auth.dependencies import get_current_user
 from app.models.questionnaire import (
@@ -34,6 +35,39 @@ async def generate_with_criteria(
         compliance_concerns=request.compliance_concerns,
         controls_to_skip=request.controls_to_skip,
         assessment_id=request.assessment_id,
+    )
+
+
+@router.post("/generate-with-criteria-stream")
+async def generate_with_criteria_stream(
+    request: GenerateWithCriteriaRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Stream SSE progress events during batch question generation.
+
+    Emits:
+      event: progress — {"batch": 2, "total": 4, "controls_done": 50, "total_controls": 93}
+      event: complete — full QuestionnaireComplete JSON
+      event: error   — {"error": "description"}
+    """
+    agent = await get_questionnaire_agent()
+    return StreamingResponse(
+        agent.generate_with_criteria_stream(
+            project_id=request.project_id,
+            user_id=current_user["user_id"],
+            maturity_level=request.maturity_level,
+            question_depth=request.question_depth,
+            priority_domains=request.priority_domains,
+            compliance_concerns=request.compliance_concerns,
+            controls_to_skip=request.controls_to_skip,
+            assessment_id=request.assessment_id,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

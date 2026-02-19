@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = "claude-3-5-sonnet-20241022"
 MAX_TOKENS = 8192
 CRITERIA_MAX_TOKENS = 8192  # Batch generation needs much more output space
+MAX_CONCURRENT_BATCHES = 3  # Cap parallel API calls to respect rate limits
 
 # Tool definition for the conversational loop
 TOOLS = [
@@ -155,6 +156,10 @@ class QuestionnaireSession:
 
 # Session store (in-memory; sessions lost on restart)
 _sessions: dict[str, QuestionnaireSession] = {}
+
+# Framework controls cache (avoids repeated full-table scans)
+_controls_cache: dict[str, tuple[float, list]] = {}
+CONTROLS_CACHE_TTL = 3600  # 1 hour
 
 # Singleton
 _agent: Optional["QuestionnaireAgent"] = None
@@ -295,12 +300,10 @@ class QuestionnaireAgent:
                 criteria_summary="No controls selected"
             )
 
-        # Split controls into batches of 15 to stay within token limits
-        batch_size = 15
+        # Split controls into batches of 25 to reduce API round-trips
+        batch_size = 25
         batches = [all_controls[i:i + batch_size] for i in range(0, len(all_controls), batch_size)]
-        
-        all_generated_controls = []
-        
+
         criteria_summary = self._build_criteria_summary(
             maturity_level=maturity_level,
             question_depth=question_depth,
@@ -320,53 +323,28 @@ class QuestionnaireAgent:
         )
         _sessions[session_id] = session
 
-        logger.info(f"Starting batch generation for {len(all_controls)} controls in {len(batches)} batches")
+        logger.info(f"Starting batch generation for {len(all_controls)} controls in {len(batches)} batches (parallel, max {MAX_CONCURRENT_BATCHES})")
 
-        for i, batch in enumerate(batches):
-            logger.info(f"Processing batch {i+1}/{len(batches)} ({len(batch)} controls)")
-            
-            batch_controls_text = self._format_batch_controls(batch)
-
-            # Build a specialized prompt for this batch
-            batch_system_prompt = self._build_batch_system_prompt(
-                context,
-                batch_controls_text,
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
+        tasks = [
+            self._process_single_batch(
+                semaphore, i, batch, context, session,
                 maturity_level=maturity_level,
                 question_depth=question_depth,
                 priority_domains=priority_domains,
                 compliance_concerns=compliance_concerns,
                 controls_to_skip=controls_to_skip,
             )
-            
-            # Update session's system prompt for this call (for logging/history)
-            session.system_prompt = batch_system_prompt
-            
-            try:
-                response = await self._client.messages.create(
-                    model=self._model,
-                    max_tokens=CRITERIA_MAX_TOKENS,
-                    system=batch_system_prompt,
-                    messages=[
-                        {"role": "user", "content": "Generate the compliance assessment questions for these specific controls."}
-                    ],
-                )
-                
-                # Parse questions from this batch
-                text = ""
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        text += block.text
-                
-                batch_controls = self._parse_questions(text, session_id)
-                all_generated_controls.extend(batch_controls)
-                
-                # Store message in history (optional, might get large)
-                session.messages.append({"role": "assistant", "content": f"Batch {i+1} generated."})
-                
-            except Exception as e:
-                logger.error(f"Error in batch {i+1}: {e}")
-                # Continue with next batch if one fails, or we could stop
+            for i, batch in enumerate(batches)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_generated_controls = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Batch {i+1}/{len(batches)} failed: {result}")
                 continue
+            all_generated_controls.extend(result)
 
         # Final result assembly
         total_questions = sum(len(c.questions) for c in all_generated_controls)
@@ -386,6 +364,200 @@ class QuestionnaireAgent:
             generation_time_ms=elapsed_ms,
             criteria_summary=criteria_summary,
         )
+
+    async def generate_with_criteria_stream(
+        self,
+        project_id: str,
+        user_id: str,
+        maturity_level: str,
+        question_depth: str,
+        priority_domains: list[str],
+        compliance_concerns: str | None = None,
+        controls_to_skip: str | None = None,
+        assessment_id: str | None = None,
+    ):
+        """Stream SSE events as batches complete during question generation."""
+        session_id = str(uuid.uuid4())
+        started_at = int(time.time() * 1000)
+
+        # Check for cached session
+        if assessment_id:
+            existing = await self._get_existing_session(assessment_id)
+            if existing:
+                yield f"event: complete\ndata: {json.dumps(existing.model_dump())}\n\n"
+                return
+
+        context = await self._fetch_project_context(project_id)
+        client_id = context.get("client_id", "")
+
+        all_controls = self._build_controls_list(context)
+        if priority_domains:
+            all_controls = self._filter_controls(all_controls, priority_domains)
+
+        if not all_controls:
+            empty = QuestionnaireComplete(
+                session_id=session_id,
+                controls=[],
+                total_controls=0,
+                total_questions=0,
+                generation_time_ms=int(time.time() * 1000) - started_at,
+                criteria_summary="No controls selected",
+            )
+            yield f"event: complete\ndata: {json.dumps(empty.model_dump())}\n\n"
+            return
+
+        batch_size = 25
+        batches = [all_controls[i:i + batch_size] for i in range(0, len(all_controls), batch_size)]
+        total_batches = len(batches)
+
+        criteria_summary = self._build_criteria_summary(
+            maturity_level=maturity_level,
+            question_depth=question_depth,
+            priority_domains=priority_domains,
+            compliance_concerns=compliance_concerns,
+            controls_to_skip=controls_to_skip,
+        )
+
+        session = QuestionnaireSession(
+            session_id=session_id,
+            project_id=project_id,
+            client_id=client_id,
+            user_id=user_id,
+            assessment_id=assessment_id,
+            project_context=context,
+            started_at_ms=started_at,
+        )
+        _sessions[session_id] = session
+
+        # Emit initial progress
+        yield f"event: progress\ndata: {json.dumps({'batch': 0, 'total': total_batches, 'controls_done': 0, 'total_controls': len(all_controls)})}\n\n"
+
+        # Track progress from parallel batches via an asyncio.Queue
+        progress_queue: asyncio.Queue = asyncio.Queue()
+
+        def on_batch_progress(batch_idx: int, controls_count: int):
+            progress_queue.put_nowait((batch_idx, controls_count))
+
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
+        gather_task = asyncio.ensure_future(
+            asyncio.gather(
+                *[
+                    self._process_single_batch(
+                        semaphore, i, batch, context, session,
+                        maturity_level=maturity_level,
+                        question_depth=question_depth,
+                        priority_domains=priority_domains,
+                        compliance_concerns=compliance_concerns,
+                        controls_to_skip=controls_to_skip,
+                        on_progress=on_batch_progress,
+                    )
+                    for i, batch in enumerate(batches)
+                ],
+                return_exceptions=True,
+            )
+        )
+
+        # Yield progress events as batches complete
+        batches_done = 0
+        controls_done = 0
+        while batches_done < total_batches:
+            try:
+                batch_idx, batch_controls_count = await asyncio.wait_for(
+                    progress_queue.get(), timeout=120.0
+                )
+                batches_done += 1
+                controls_done += batch_controls_count
+                progress_data = json.dumps({
+                    "batch": batches_done,
+                    "total": total_batches,
+                    "controls_done": controls_done,
+                    "total_controls": len(all_controls),
+                })
+                yield f"event: progress\ndata: {progress_data}\n\n"
+            except asyncio.TimeoutError:
+                yield f"event: error\ndata: {json.dumps({'error': 'Batch processing timed out'})}\n\n"
+                return
+
+        # Collect results
+        results = await gather_task
+        all_generated_controls = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Batch {i+1}/{total_batches} failed: {result}")
+                continue
+            all_generated_controls.extend(result)
+
+        total_questions = sum(len(c.questions) for c in all_generated_controls)
+        elapsed_ms = int(time.time() * 1000) - started_at
+        session.status = "completed"
+
+        await self._persist_results(
+            session, all_generated_controls, total_questions, elapsed_ms, criteria_summary
+        )
+
+        complete = QuestionnaireComplete(
+            session_id=session_id,
+            controls=all_generated_controls,
+            total_controls=len(all_generated_controls),
+            total_questions=total_questions,
+            generation_time_ms=elapsed_ms,
+            criteria_summary=criteria_summary,
+        )
+        yield f"event: complete\ndata: {json.dumps(complete.model_dump())}\n\n"
+
+    async def _process_single_batch(
+        self,
+        semaphore: asyncio.Semaphore,
+        batch_index: int,
+        batch: list[dict],
+        context: dict,
+        session: "QuestionnaireSession",
+        *,
+        maturity_level: str,
+        question_depth: str,
+        priority_domains: list[str],
+        compliance_concerns: str | None,
+        controls_to_skip: str | None,
+        on_progress: Any | None = None,
+    ) -> list[ControlQuestions]:
+        """Process a single batch of controls under semaphore concurrency."""
+        async with semaphore:
+            batch_num = batch_index + 1
+            logger.info(f"Processing batch {batch_num} ({len(batch)} controls)")
+
+            batch_controls_text = self._format_batch_controls(batch)
+
+            batch_system_prompt = self._build_batch_system_prompt(
+                context,
+                batch_controls_text,
+                maturity_level=maturity_level,
+                question_depth=question_depth,
+                priority_domains=priority_domains,
+                compliance_concerns=compliance_concerns,
+                controls_to_skip=controls_to_skip,
+            )
+
+            response = await self._client.messages.create(
+                model=self._model,
+                max_tokens=CRITERIA_MAX_TOKENS,
+                system=batch_system_prompt,
+                messages=[
+                    {"role": "user", "content": "Generate the compliance assessment questions for these specific controls."}
+                ],
+            )
+
+            text = ""
+            for block in response.content:
+                if hasattr(block, "text"):
+                    text += block.text
+
+            batch_controls = self._parse_questions(text, session.session_id)
+            logger.info(f"Batch {batch_num} complete: {len(batch_controls)} controls, {sum(len(c.questions) for c in batch_controls)} questions")
+
+            if on_progress:
+                on_progress(batch_index, len(batch_controls))
+
+            return batch_controls
 
     def _build_batch_system_prompt(
         self,
@@ -564,6 +736,29 @@ Ensure questions are specific to {org_name}'s context."""
     # Context fetching (parallel)
     # ------------------------------------------------------------------
 
+    async def _fetch_cached_controls(self, table_name: str, sb: Any) -> list:
+        """Fetch framework controls with TTL caching to avoid repeated full-table scans."""
+        now = time.time()
+        if table_name in _controls_cache:
+            cached_at, data = _controls_cache[table_name]
+            if now - cached_at < CONTROLS_CACHE_TTL:
+                logger.debug(f"Cache hit for {table_name} ({len(data)} rows)")
+                return data
+
+        try:
+            result = await sb.table(table_name).select("*").execute()
+            data = result.data or []
+            _controls_cache[table_name] = (now, data)
+            logger.info(f"Cached {len(data)} rows from {table_name}")
+            return data
+        except Exception as e:
+            logger.warning(f"Failed to fetch {table_name}: {e}")
+            # Return stale cache if available
+            if table_name in _controls_cache:
+                _, data = _controls_cache[table_name]
+                return data
+            return []
+
     async def _fetch_project_context(self, project_id: str) -> dict:
         """Fetch all context needed for question generation in parallel."""
         from app.db.supabase import get_async_supabase_client_async
@@ -610,43 +805,17 @@ Ensure questions are specific to {org_name}'s context."""
 
         frameworks = context["selected_frameworks"]
 
-        # Phase 2: Fetch client info + only needed framework controls
-        phase2_coros: list = []
-        phase2_keys: list[str] = []
-
+        # Phase 2: Fetch client info (fresh) + framework controls (cached)
         client_id = context.get("client_id", "")
         if client_id:
-            phase2_coros.append(
-                sb.table("clients").select("*").eq("id", client_id).execute()
-            )
-            phase2_keys.append("client")
-
-        if not frameworks or "ISO 27001:2022" in frameworks:
-            phase2_coros.append(
-                sb.table("iso_requirements").select("*").execute()
-            )
-            phase2_keys.append("iso")
-
-        if not frameworks or "BNM RMIT" in frameworks:
-            phase2_coros.append(
-                sb.table("bnm_rmit_requirements").select("*").execute()
-            )
-            phase2_keys.append("bnm")
-
-        if phase2_coros:
-            phase2_results = await asyncio.gather(
-                *phase2_coros, return_exceptions=True
-            )
-            phase2_map = dict(zip(phase2_keys, phase2_results))
-        else:
-            phase2_map = {}
-
-        # Client info
-        client_res = phase2_map.get("client")
-        if client_res and not isinstance(client_res, Exception) and client_res.data:
-            client = client_res.data[0]
-            context["organization_name"] = client.get("name", "")
-            context["industry"] = client.get("industry", "")
+            try:
+                client_res = await sb.table("clients").select("*").eq("id", client_id).execute()
+                if client_res.data:
+                    client = client_res.data[0]
+                    context["organization_name"] = client.get("name", "")
+                    context["industry"] = client.get("industry", "")
+            except Exception as e:
+                logger.warning(f"Failed to fetch client info: {e}")
 
         # Findings
         if not isinstance(findings_res, Exception) and findings_res.data:
@@ -663,16 +832,14 @@ Ensure questions are specific to {org_name}'s context."""
             context["business_context"] = {}
             context["digital_assets"] = []
 
-        # Framework controls (only fetched if needed)
-        iso_res = phase2_map.get("iso")
-        if iso_res and not isinstance(iso_res, Exception) and iso_res.data:
-            context["iso_controls"] = iso_res.data
+        # Framework controls (cached — these rarely change)
+        if not frameworks or "ISO 27001:2022" in frameworks:
+            context["iso_controls"] = await self._fetch_cached_controls("iso_requirements", sb)
         else:
             context["iso_controls"] = []
 
-        bnm_res = phase2_map.get("bnm")
-        if bnm_res and not isinstance(bnm_res, Exception) and bnm_res.data:
-            context["bnm_controls"] = bnm_res.data
+        if not frameworks or "BNM RMIT" in frameworks:
+            context["bnm_controls"] = await self._fetch_cached_controls("bnm_rmit_requirements", sb)
         else:
             context["bnm_controls"] = []
 
