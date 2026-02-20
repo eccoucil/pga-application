@@ -21,6 +21,12 @@ cd frontend && npm run dev -- -p 3001
 # Docker services (Qdrant + Neo4j)
 cd backend && docker-compose up -d
 
+# Full-stack Docker (production)
+docker compose up --build
+
+# Full-stack Docker (dev with hot reload)
+docker compose --profile dev up
+
 # Backend tests
 cd backend && uv run pytest
 
@@ -46,15 +52,16 @@ cd frontend && npm run lint
 
 - **FastAPI** with `asynccontextmanager` lifespan (not deprecated `on_event`)
 - **Supabase** (PostgreSQL + Auth + RLS) — backend uses **service key** (bypasses RLS)
-- **Qdrant** — vector DB, collection `"pga_documents"`, 1536-dim cosine (matches `text-embedding-3-small`)
+- **Qdrant** — vector DB, collection `"pga_documents"`, 1536-dim cosine (matches `text-embedding-3-small`). Also has **pgvector** alternative via `SupabaseVectorService` (migration 015, `document_chunks` table)
 - **Neo4j** 5.15 with APOC — graph DB for organization/asset relationships
 - **uv** as package manager (not pip): `uv run <command>`, `uv sync`
 
 ### Backend Key Files
 
-- **config.py** — Pydantic settings management (loads from `.env`)
+- **config.py** — Pydantic settings management (loads from `.env`). Default Claude model: `claude-sonnet-4-20250514`.
 - **auth/dependencies.py** — Supabase JWT validation (`get_current_user` dependency). Supports both ES256 (JWKS) and HS256 (legacy). Returns `{"user_id", "email", "role"}`.
 - **db/supabase.py** — Database client creation (see Gotchas below)
+- **routers/framework_docs.py** — CRUD for ISO 27001 and BNM RMIT controls. Reads/writes markdown files from `docs/framework/` as authoritative source. Prefix: `/framework-docs`.
 
 ### Backend Services (`backend/app/services/`)
 
@@ -64,6 +71,9 @@ cd frontend && npm run lint
 - **neo4j_service.py** — Graph operations (Company, DigitalAsset, Policy, Document nodes)
 - **qdrant_service.py** — Vector search. Uses `AsyncQdrantClient` with `query_points` (not `search`).
 - **embedding_service.py** — OpenAI `text-embedding-3-small` embeddings
+- **question_swarm.py** — 4-agent parallel question generation. Round-robin distributes controls across `WorkerAgent` instances via `asyncio.gather()`. Exploits Anthropic prompt caching — shared context (org info, criteria, JSON schema) marked `cache_control: {"type": "ephemeral"}` is identical across all workers, yielding ~90% input token discount on workers 2-4. `generate_stream()` yields SSE events via `asyncio.Queue` with 180s per-agent timeout.
+- **supabase_vector_service.py** — pgvector-based vector search (alternative to Qdrant). Uses `document_chunks` table with `vector(1536)` and RPC functions `match_document_chunks`/`match_client_extractions`.
+- **document_analyzer.py** — Claude-powered policy document analyzer. Classifies documents by `PolicyType` (15 enum values) and maps to ISO 27001 / BNM RMIT controls.
 
 ### Assessment Flow (data pipeline)
 
@@ -96,6 +106,10 @@ Two generation paths:
 
 2. **Wizard/batch** (`POST /questionnaire/generate-with-criteria`): All criteria provided upfront, skips conversation.
 
+3. **Streaming wizard** (`POST /questionnaire/generate-with-criteria-stream`): Same as wizard but returns SSE (`StreamingResponse`). Events: `progress` (per-batch), `agent_complete` (per-worker), `complete` (full result), `error`. Uses the 4-agent `QuestionGenerationSwarm`. Frontend hook `useQuestionnaireAgent` tracks per-agent status via `agentProgress` map.
+
+**Session retrieval**: `GET /questionnaire/sessions?project_id=X&assessment_id=Y` (list) and `GET /questionnaire/sessions/{session_id}` (full detail).
+
 Context fetching is two-phase parallel: (project + findings + crawl results) then (client info + framework controls conditional on selected frameworks). Neo4j and Qdrant context are optional/non-blocking.
 
 ### Frontend Stack
@@ -104,7 +118,9 @@ Context fetching is two-phase parallel: (project + findings + crawl results) the
 - **Tailwind CSS 4** with `@tailwindcss/postcss`
 - **@xyflow/react** v12 for knowledge graph visualization
 - **Radix UI** primitives (dialog, select, checkbox, dropdown, popover, toast)
-- **lucide-react** for icons (primary icon library)
+- **lucide-react** for icons (primary), **@heroicons/react** (secondary)
+- **react-markdown** for rich text rendering
+- **Jest** + **@testing-library/react** for frontend tests
 - Path alias: `@/*` → `./src/*`
 
 ### Frontend State Management
@@ -128,13 +144,13 @@ Permissions are calculated client-side from role: `viewer` (view only) → `memb
 
 ### Frontend Routes
 
-- `/login` — Supabase email/password auth
-- `/clients` — Client management with CRUD
+- `/login` — Supabase email/password auth (also handles sign-up; redirects authenticated users)
+- `/clients` — Client management with CRUD (also accessible via `/organizations`)
 - `/clients/[id]/projects` — Project listing
 - `/clients/[id]/projects/[projectId]/assessment` — Multi-step assessment (stepper UI)
 - `/clients/[id]/projects/[projectId]/findings` — Results with knowledge graph
-- `/clients/[id]/projects/[projectId]/annex-a` — ISO 27001 Annex A controls
-- `/clients/[id]/projects/[projectId]/management-clauses` — ISO 27001 management clauses
+- `/clients/[id]/projects/[projectId]/controls` — Unified ISO 27001 controls (Annex A + management clauses merged)
+- `/clients/[id]/projects/[projectId]/bnm-rmit` — BNM RMIT requirements
 
 ### Database Schema
 
@@ -142,7 +158,10 @@ Permissions are calculated client-side from role: `viewer` (view only) → `memb
 - `clients` — Client organizations (**Note**: `name` = company name, `company` = contact person)
 - `projects` — `framework` field is `string[] | null` (multi-framework)
 - `client_members` — Multi-tenant membership with roles (owner/admin/member/viewer)
-- `questionnaire_sessions` — Completed sessions persisted with `generated_questions`, `agent_criteria`, `conversation_history` as JSONB
+- `assessments` — Assessment records with auto-incrementing `version` per project (migration 012)
+- `questionnaire_sessions` — Completed sessions persisted with `generated_questions`, `agent_criteria`, `conversation_history` as JSONB. Has `assessment_id` FK, plus `pending_tool_use_id`/`started_at_ms` for surviving backend restarts.
+- `profiles` — User profiles (auto-created by trigger on sign-up): `full_name`, `organization`, `phone`, `job_title`
+- `document_chunks` — pgvector-powered chunks with `vector(1536)` columns (migration 015)
 - `gap_analysis_findings`, `project_documents`, `web_crawl_results`
 - `iso_requirements`, `bnm_rmit_requirements`, `compliance_mapping`
 
@@ -185,7 +204,7 @@ Permissions are calculated client-side from role: `viewer` (view only) → `memb
 Both the orchestrator (`active_assessments` dict) and questionnaire agent (`_sessions` dict) store state in memory. **Server restarts lose all active sessions.** Completed questionnaire sessions are persisted to Supabase, active conversations are not.
 
 ### CORS
-Hardcoded to `http://localhost:3001` in `main.py`. No env-var override — must edit code for different frontend origins.
+Configurable via `CORS_ORIGINS` env var (comma-separated). Defaults to `http://localhost:3001`. Set in `config.py`, split by comma in `main.py`.
 
 ### Graceful Degradation
 The app starts even if Neo4j/Qdrant Docker services are down. `GET /health` returns `"degraded"` status. Services that depend on them will fail at call time, not at startup.
@@ -221,6 +240,7 @@ NEO4J_USER=neo4j
 NEO4J_PASSWORD
 QDRANT_HOST=localhost
 QDRANT_PORT=16333
+CORS_ORIGINS=http://localhost:3001  # comma-separated for multiple
 ```
 
 **Frontend** (`frontend/.env.local`):
