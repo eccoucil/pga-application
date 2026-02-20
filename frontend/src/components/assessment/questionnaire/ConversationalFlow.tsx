@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { Loader2, Sparkles, AlertCircle, RefreshCw } from "lucide-react";
+import { Loader2, Sparkles, AlertCircle, RefreshCw, CheckCircle2 } from "lucide-react";
 import { useQuestionnaireAgent } from "@/hooks/use-questionnaire-agent";
+import type { AgentStatus } from "@/hooks/use-questionnaire-agent";
 import type { QuestionnaireComplete } from "@/types/questionnaire";
 import { QuestionCard } from "./QuestionCard";
 import { AnsweredQuestionCard } from "./AnsweredQuestionCard";
@@ -26,6 +27,7 @@ export function ConversationalFlow({
     result,
     error,
     progress,
+    agentProgress,
     startSession,
     submitAnswer,
     retry,
@@ -104,9 +106,13 @@ export function ConversationalFlow({
                   ? answeredQuestions.length < 2
                     ? "Processing your response..."
                     : "Generating tailored compliance questions..."
-                  : `Generating questions... Batch ${progress.batch}/${progress.total} (${progress.controlsDone} controls processed)`}
+                  : progress.totalAgents
+                    ? `Generating questions... ${progress.agentsComplete ?? 0}/${progress.totalAgents} agents complete (${progress.controlsDone} controls)`
+                    : `Generating questions... Batch ${progress.batch}/${progress.total} (${progress.controlsDone} controls processed)`}
               </span>
             </div>
+
+            {/* Overall progress bar */}
             {progress && progress.total > 0 && (
               <div className="mx-auto max-w-md space-y-2">
                 <div className="h-2 bg-white/5 rounded-full overflow-hidden">
@@ -120,6 +126,52 @@ export function ConversationalFlow({
                 <p className="text-xs text-slate-500 text-center">
                   {progress.controlsDone} / {progress.totalControls} controls
                 </p>
+              </div>
+            )}
+
+            {/* Per-agent progress grid */}
+            {agentProgress.size > 0 && (
+              <div className="mx-auto max-w-lg grid grid-cols-2 gap-2 mt-3">
+                {Array.from(agentProgress.values()).map((agent) => (
+                  <div
+                    key={agent.agentId}
+                    className="flex items-center gap-2 px-3 py-2 bg-white/[0.03] border border-white/[0.06] rounded-lg"
+                  >
+                    {agent.status === "complete" ? (
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 flex-shrink-0" />
+                    ) : agent.status === "failed" ? (
+                      <AlertCircle className="h-3.5 w-3.5 text-red-400 flex-shrink-0" />
+                    ) : (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-400 flex-shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-medium text-slate-300 truncate">
+                          {agent.label}
+                        </span>
+                        {agent.status === "complete" && (
+                          <span className="text-[10px] text-slate-500 ml-1">
+                            {agent.questionsGenerated}q
+                          </span>
+                        )}
+                      </div>
+                      <div className="h-1 bg-white/5 rounded-full overflow-hidden mt-1">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ease-out ${
+                            agent.status === "complete"
+                              ? "bg-emerald-500"
+                              : agent.status === "failed"
+                                ? "bg-red-500"
+                                : "bg-cyan-500/60 animate-pulse"
+                          }`}
+                          style={{
+                            width: agent.status === "complete" ? "100%" : agent.status === "failed" ? "100%" : "60%",
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
             )}
           </div>

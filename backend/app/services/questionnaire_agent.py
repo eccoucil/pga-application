@@ -24,15 +24,20 @@ from tenacity import (
     wait_exponential,
 )
 
-from fastapi import HTTPException
-
 from app.config import get_settings
 from app.models.questionnaire import (
     AgentQuestion,
     ControlQuestions,
-    GeneratedQuestion,
     QuestionnaireComplete,
     QuestionnaireResponse,
+)
+from app.services.question_swarm import (
+    QuestionGenerationSwarm,
+    _extract_json_array as extract_json_array,
+    _parse_questions as parse_questions,
+)
+from app.services.question_swarm_prompts import (
+    format_batch_controls as _fmt_controls,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,6 +207,9 @@ class QuestionnaireAgent:
             api_key=settings.anthropic_api_key,
             http_client=http_client
         )
+        self._swarm = QuestionGenerationSwarm(
+            client=self._client, model=self._model
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -300,10 +308,6 @@ class QuestionnaireAgent:
                 criteria_summary="No controls selected"
             )
 
-        # Split controls into batches of 25 to reduce API round-trips
-        batch_size = 25
-        batches = [all_controls[i:i + batch_size] for i in range(0, len(all_controls), batch_size)]
-
         criteria_summary = self._build_criteria_summary(
             maturity_level=maturity_level,
             question_depth=question_depth,
@@ -323,28 +327,18 @@ class QuestionnaireAgent:
         )
         _sessions[session_id] = session
 
-        logger.info(f"Starting batch generation for {len(all_controls)} controls in {len(batches)} batches (parallel, max {MAX_CONCURRENT_BATCHES})")
-
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
-        tasks = [
-            self._process_single_batch(
-                semaphore, i, batch, context, session,
-                maturity_level=maturity_level,
-                question_depth=question_depth,
-                priority_domains=priority_domains,
-                compliance_concerns=compliance_concerns,
-                controls_to_skip=controls_to_skip,
-            )
-            for i, batch in enumerate(batches)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_generated_controls = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Batch {i+1}/{len(batches)} failed: {result}")
-                continue
-            all_generated_controls.extend(result)
+        # Use swarm for parallel generation across 4 agents
+        criteria_dict = {
+            "maturity_level": maturity_level,
+            "question_depth": question_depth,
+            "priority_domains": priority_domains,
+            "compliance_concerns": compliance_concerns,
+            "controls_to_skip": controls_to_skip,
+        }
+        swarm_result = await self._swarm.generate(
+            all_controls, context, criteria_dict, session_id
+        )
+        all_generated_controls = swarm_result.controls
 
         # Final result assembly
         total_questions = sum(len(c.questions) for c in all_generated_controls)
@@ -406,10 +400,6 @@ class QuestionnaireAgent:
             yield f"event: complete\ndata: {json.dumps(empty.model_dump())}\n\n"
             return
 
-        batch_size = 25
-        batches = [all_controls[i:i + batch_size] for i in range(0, len(all_controls), batch_size)]
-        total_batches = len(batches)
-
         criteria_summary = self._build_criteria_summary(
             maturity_level=maturity_level,
             question_depth=question_depth,
@@ -429,63 +419,24 @@ class QuestionnaireAgent:
         )
         _sessions[session_id] = session
 
-        # Emit initial progress
-        yield f"event: progress\ndata: {json.dumps({'batch': 0, 'total': total_batches, 'controls_done': 0, 'total_controls': len(all_controls)})}\n\n"
+        # Stream progress from swarm agents
+        criteria_dict = {
+            "maturity_level": maturity_level,
+            "question_depth": question_depth,
+            "priority_domains": priority_domains,
+            "compliance_concerns": compliance_concerns,
+            "controls_to_skip": controls_to_skip,
+        }
 
-        # Track progress from parallel batches via an asyncio.Queue
-        progress_queue: asyncio.Queue = asyncio.Queue()
+        from app.services.question_swarm import SwarmResult
+        swarm_result = SwarmResult()
+        async for event in self._swarm.generate_stream(
+            all_controls, context, criteria_dict, session_id,
+            result_out=swarm_result,
+        ):
+            yield event
 
-        def on_batch_progress(batch_idx: int, controls_count: int):
-            progress_queue.put_nowait((batch_idx, controls_count))
-
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
-        gather_task = asyncio.ensure_future(
-            asyncio.gather(
-                *[
-                    self._process_single_batch(
-                        semaphore, i, batch, context, session,
-                        maturity_level=maturity_level,
-                        question_depth=question_depth,
-                        priority_domains=priority_domains,
-                        compliance_concerns=compliance_concerns,
-                        controls_to_skip=controls_to_skip,
-                        on_progress=on_batch_progress,
-                    )
-                    for i, batch in enumerate(batches)
-                ],
-                return_exceptions=True,
-            )
-        )
-
-        # Yield progress events as batches complete
-        batches_done = 0
-        controls_done = 0
-        while batches_done < total_batches:
-            try:
-                batch_idx, batch_controls_count = await asyncio.wait_for(
-                    progress_queue.get(), timeout=120.0
-                )
-                batches_done += 1
-                controls_done += batch_controls_count
-                progress_data = json.dumps({
-                    "batch": batches_done,
-                    "total": total_batches,
-                    "controls_done": controls_done,
-                    "total_controls": len(all_controls),
-                })
-                yield f"event: progress\ndata: {progress_data}\n\n"
-            except asyncio.TimeoutError:
-                yield f"event: error\ndata: {json.dumps({'error': 'Batch processing timed out'})}\n\n"
-                return
-
-        # Collect results
-        results = await gather_task
-        all_generated_controls = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"Batch {i+1}/{total_batches} failed: {result}")
-                continue
-            all_generated_controls.extend(result)
+        all_generated_controls = swarm_result.controls
 
         total_questions = sum(len(c.questions) for c in all_generated_controls)
         elapsed_ms = int(time.time() * 1000) - started_at
@@ -1309,13 +1260,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
     @staticmethod
     def _format_batch_controls(batch: list[dict]) -> str:
         """Format a batch of controls into text for the batch system prompt."""
-        lines: list[str] = []
-        for c in batch:
-            section_ctx = f" ({c['section_title']})" if c.get("section_title") else ""
-            lines.append(
-                f"- **{c['id']}** [{c['framework']}]{section_ctx}: {c['title']} — {c['desc']}"
-            )
-        return "\n".join(lines)
+        return _fmt_controls(batch)
 
     async def _run_batch_generation(
         self,
@@ -1352,58 +1297,18 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
                 criteria_summary=criteria_summary,
             )
 
-        batch_size = 15
-        batches = [
-            all_controls[i : i + batch_size]
-            for i in range(0, len(all_controls), batch_size)
-        ]
-        all_generated: list[ControlQuestions] = []
-
-        logger.info(
-            f"Session {session.session_id}: starting batch generation for "
-            f"{len(all_controls)} controls in {len(batches)} batches"
+        # Use swarm for parallel generation (replaces sequential batch loop)
+        criteria_dict = {
+            "maturity_level": maturity_level,
+            "question_depth": question_depth,
+            "priority_domains": priority_domains,
+            "compliance_concerns": compliance_concerns,
+            "questions_per_control": questions_per_control,
+        }
+        swarm_result = await self._swarm.generate(
+            all_controls, context, criteria_dict, session.session_id
         )
-
-        for i, batch in enumerate(batches):
-            logger.info(
-                f"Session {session.session_id}: processing batch "
-                f"{i + 1}/{len(batches)} ({len(batch)} controls)"
-            )
-            batch_text = self._format_batch_controls(batch)
-            batch_prompt = self._build_batch_system_prompt(
-                context,
-                batch_text,
-                maturity_level=maturity_level,
-                question_depth=question_depth,
-                priority_domains=priority_domains,
-                compliance_concerns=compliance_concerns,
-                controls_to_skip=None,
-                questions_per_control=questions_per_control,
-            )
-            try:
-                resp = await self._client.messages.create(
-                    model=self._model,
-                    max_tokens=CRITERIA_MAX_TOKENS,
-                    system=batch_prompt,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": "Generate the compliance assessment questions for these specific controls.",
-                        }
-                    ],
-                )
-                text = "".join(
-                    b.text for b in resp.content if hasattr(b, "text")
-                )
-                all_generated.extend(
-                    self._parse_questions(text, session.session_id)
-                )
-            except Exception as e:
-                logger.error(
-                    f"Session {session.session_id}: batch {i + 1}/{len(batches)} "
-                    f"failed: {e}"
-                )
-                continue
+        all_generated = swarm_result.controls
 
         total_q = sum(len(c.questions) for c in all_generated)
         elapsed_ms = int(time.time() * 1000) - session.started_at_ms
@@ -1470,85 +1375,12 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
         self, text: str, session_id: str
     ) -> list[ControlQuestions]:
         """Extract JSON questions array from Claude's final response."""
-        # Try to find JSON array in the response
-        json_str = self._extract_json_array(text)
-        if not json_str:
-            logger.error(
-                f"Session {session_id}: Could not extract JSON from response"
-            )
-            return []
-
-        try:
-            raw = json.loads(json_str)
-        except json.JSONDecodeError as e:
-            logger.error(f"Session {session_id}: JSON parse error: {e}")
-            return []
-
-        controls = []
-        for item in raw:
-            questions = []
-            for q in item.get("questions", []):
-                questions.append(
-                    GeneratedQuestion(
-                        id=q.get("id", f"q-{uuid.uuid4().hex[:8]}"),
-                        question=q.get("question", ""),
-                        category=q.get("category", "general"),
-                        priority=q.get("priority", "medium"),
-                        expected_evidence=q.get("expected_evidence"),
-                        guidance_notes=q.get("guidance_notes"),
-                    )
-                )
-            controls.append(
-                ControlQuestions(
-                    control_id=item.get("control_id", ""),
-                    control_title=item.get("control_title", ""),
-                    framework=item.get("framework", ""),
-                    questions=questions,
-                )
-            )
-
-        return controls
+        return parse_questions(text, session_id)
 
     @staticmethod
     def _extract_json_array(text: str) -> Optional[str]:
         """Find the outermost JSON array in a text blob."""
-        # Clean up the text - remove common issues
-        text = text.strip()
-        
-        # Look for ```json ... ``` fenced block first
-        import re
-
-        # More robust regex for JSON blocks
-        fence_match = re.search(
-            r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text, re.IGNORECASE
-        )
-        if fence_match:
-            return fence_match.group(1)
-
-        # Fallback: find first [ and matching ]
-        start = text.find("[")
-        if start == -1:
-            return None
-
-        # Try to find the last ] to be as inclusive as possible
-        end = text.rfind("]")
-        if end == -1 or end < start:
-            return None
-            
-        # If we have a lot of text, try to find matching brackets specifically
-        # to avoid capturing too much if there are multiple arrays
-        depth = 0
-        for i in range(start, len(text)):
-            if text[i] == "[":
-                depth += 1
-            elif text[i] == "]":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-
-        # If we didn't find a matching depth but have a start and end,
-        # return everything between them as a last resort (might be truncated)
-        return text[start : end + 1]
+        return extract_json_array(text)
 
     def _extract_criteria_summary(self, session: QuestionnaireSession) -> str:
         """Build a summary of the user's stated criteria from the conversation."""

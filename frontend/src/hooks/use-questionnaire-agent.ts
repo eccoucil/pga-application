@@ -31,6 +31,20 @@ export interface GenerationProgress {
   total: number;
   controlsDone: number;
   totalControls: number;
+  // Per-agent tracking
+  agentId?: number;
+  agentLabel?: string;
+  agentsComplete?: number;
+  totalAgents?: number;
+}
+
+export interface AgentStatus {
+  agentId: number;
+  label: string;
+  controlsAssigned: number;
+  controlsDone: number;
+  questionsGenerated: number;
+  status: "working" | "complete" | "failed";
 }
 
 interface UseQuestionnaireAgentReturn {
@@ -40,6 +54,7 @@ interface UseQuestionnaireAgentReturn {
   result: QuestionnaireComplete | null;
   error: string | null;
   progress: GenerationProgress | null;
+  agentProgress: Map<number, AgentStatus>;
   startSession: (projectId: string, assessmentId?: string) => Promise<void>;
   generateWithCriteria: (
     criteria: GenerateWithCriteriaRequest,
@@ -93,6 +108,9 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
   const [result, setResult] = useState<QuestionnaireComplete | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<GenerationProgress | null>(null);
+  const [agentProgress, setAgentProgress] = useState<Map<number, AgentStatus>>(
+    new Map(),
+  );
 
   // Track the session_id returned by the agent
   const sessionIdRef = useRef<string | null>(null);
@@ -204,6 +222,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
       setError(null);
       setResult(null);
       setProgress(null);
+      setAgentProgress(new Map());
 
       abortRef.current?.abort();
       const controller = new AbortController();
@@ -255,6 +274,41 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
                   total: data.total,
                   controlsDone: data.controls_done,
                   totalControls: data.total_controls,
+                  agentId: data.agent_id,
+                  agentLabel: data.agent_label,
+                  agentsComplete: data.agents_complete,
+                  totalAgents: data.total_agents,
+                });
+                // Seed agent statuses from initial progress event
+                if (
+                  data.total_agents &&
+                  data.agents_complete === 0
+                ) {
+                  const initial = new Map<number, AgentStatus>();
+                  for (let i = 0; i < data.total_agents; i++) {
+                    initial.set(i, {
+                      agentId: i,
+                      label: `Agent ${i + 1}`,
+                      controlsAssigned: 0,
+                      controlsDone: 0,
+                      questionsGenerated: 0,
+                      status: "working",
+                    });
+                  }
+                  setAgentProgress(initial);
+                }
+              } else if (currentEvent === "agent_complete") {
+                setAgentProgress((prev) => {
+                  const next = new Map(prev);
+                  next.set(data.agent_id, {
+                    agentId: data.agent_id,
+                    label: data.agent_label,
+                    controlsAssigned: data.controls_generated,
+                    controlsDone: data.controls_generated,
+                    questionsGenerated: data.questions_generated,
+                    status: "complete",
+                  });
+                  return next;
                 });
               } else if (currentEvent === "complete") {
                 setResult(data);
@@ -295,6 +349,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     setResult(null);
     setError(null);
     setProgress(null);
+    setAgentProgress(new Map());
     sessionIdRef.current = null;
   }, []);
 
@@ -305,6 +360,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     result,
     error,
     progress,
+    agentProgress,
     startSession,
     generateWithCriteria,
     submitAnswer,
