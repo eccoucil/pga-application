@@ -11,6 +11,7 @@ from app.services.question_swarm import (
     WorkerAgent,
     _extract_json_array,
     _parse_questions,
+    _try_repair_truncated_json,
 )
 from app.services.question_swarm_prompts import (
     build_controls_section,
@@ -231,7 +232,7 @@ class TestWorkerAgent:
 
     @pytest.mark.asyncio
     async def test_sub_batching(self):
-        """Controls >30 should be split into sub-batches."""
+        """Controls >20 should be split into sub-batches at default 3 qpc."""
         mock_client = AsyncMock()
         mock_client.messages.create = AsyncMock(
             return_value=_mock_response(SAMPLE_JSON_RESPONSE)
@@ -242,7 +243,7 @@ class TestWorkerAgent:
 
         await worker.generate(controls, "shared", "test-session")
 
-        # 35 controls → 2 sub-batches (30 + 5)
+        # 35 controls at 3 qpc → batch_size=20 → 2 sub-batches (20 + 15)
         assert mock_client.messages.create.call_count == 2
 
 
@@ -265,11 +266,11 @@ class TestSwarm:
         )
 
         assert isinstance(result, SwarmResult)
-        # 4 agents each produce 1 control from our sample
-        assert len(result.controls) == 4
-        assert len(result.agent_stats) == 4
-        assert result.total_input_tokens == 4000  # 1000 per agent
-        assert result.total_output_tokens == 2000  # 500 per agent
+        # 8 controls → _optimal_worker_count=2, min(2,4)=2 agents
+        assert len(result.controls) == 2
+        assert len(result.agent_stats) == 2
+        assert result.total_input_tokens == 2000  # 1000 per agent
+        assert result.total_output_tokens == 1000  # 500 per agent
 
     @pytest.mark.asyncio
     async def test_partial_failure(self):
@@ -289,21 +290,14 @@ class TestSwarm:
         swarm = QuestionGenerationSwarm(
             client=mock_client, model="test-model", num_agents=4
         )
-        # Patch workers to skip tenacity retries
-        for worker in swarm._workers:
-            original_call = worker._call_api
-
-            async def patched_call(sc, cs, _orig=original_call):
-                return await _orig(sc, cs)
-
-            worker._call_api = patched_call
-
+        # Workers are created dynamically in generate(); plain Exception
+        # bypasses tenacity retry (only RateLimitError/APITimeoutError retry)
         result = await swarm.generate(
             _make_controls(8), SAMPLE_CONTEXT, SAMPLE_CRITERIA, "test-session"
         )
 
-        # 3 successful agents produce results, 1 failed
-        assert len(result.controls) == 3
+        # 8 controls → 2 agents; call_count=2 fails → 1 success, 1 failure
+        assert len(result.controls) == 1
         failed_stats = [s for s in result.agent_stats if s.error is not None]
         assert len(failed_stats) == 1
 
@@ -377,7 +371,7 @@ class TestPrompts:
         assert "Technology" in ctx
         assert "3 questions per control" in ctx
         assert "First Time Audit" in ctx
-        assert "JSON array" in ctx
+        assert "JSON Output" in ctx
 
     def test_build_shared_context_with_options(self):
         ctx = build_shared_context(
@@ -393,7 +387,7 @@ class TestPrompts:
         assert "Priority Focus Areas" in ctx
         assert "Access Control" in ctx
         assert "Weak password policy" in ctx
-        assert "Controls to De-emphasize" in ctx
+        assert "De-emphasized Controls" in ctx
 
     def test_build_controls_section(self):
         text = build_controls_section("- A.1: Test control")
@@ -451,6 +445,53 @@ class TestParsing:
         text = '[[1, 2], [3, 4]]'
         result = _extract_json_array(text)
         assert result == '[[1, 2], [3, 4]]'
+
+
+# ── JSON repair tests ────────────────────────────────────────────────
+
+
+class TestJsonRepair:
+    def test_repair_truncated_at_object_boundary(self):
+        """Truncation after a complete object (most common case)."""
+        text = '[{"control_id":"A.1","questions":[]},{"control_id":"A.2","quest'
+        result = _try_repair_truncated_json(text)
+        assert result is not None
+        parsed = json.loads(result)
+        assert len(parsed) == 1
+        assert parsed[0]["control_id"] == "A.1"
+
+    def test_repair_truncated_inside_string(self):
+        """Truncation inside a string value creates unbalanced quotes."""
+        text = '[{"control_id":"A.1","questions":[]},{"control_id":"A.2","control_title":"Incomplete tit'
+        result = _try_repair_truncated_json(text)
+        assert result is not None
+        parsed = json.loads(result)
+        assert len(parsed) == 1
+        assert parsed[0]["control_id"] == "A.1"
+
+    def test_repair_single_complete_object(self):
+        """Only one object, cleanly terminated."""
+        text = '[{"control_id":"A.1","questions":[]}  '
+        # This isn't truncated, but missing the closing bracket
+        result = _try_repair_truncated_json(text)
+        assert result is not None
+        parsed = json.loads(result)
+        assert len(parsed) == 1
+
+    def test_repair_returns_none_for_garbage(self):
+        """Completely unparseable input returns None."""
+        assert _try_repair_truncated_json("not json") is None
+
+    def test_repair_multiple_complete_objects(self):
+        """Multiple complete objects with truncated trailing one."""
+        obj1 = '{"control_id":"A.1","questions":[]}'
+        obj2 = '{"control_id":"A.2","questions":[]}'
+        text = f'[{obj1},{obj2},{{"control_id":"A.3","quest'
+        result = _try_repair_truncated_json(text)
+        assert result is not None
+        parsed = json.loads(result)
+        assert len(parsed) == 2
+        assert parsed[1]["control_id"] == "A.2"
 
 
 # ── Token usage logging tests ────────────────────────────────────────

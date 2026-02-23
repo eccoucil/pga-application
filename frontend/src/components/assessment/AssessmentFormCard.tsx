@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState, type ChangeEvent } from "react";
+import { useRef, useState, useEffect, type ChangeEvent } from "react";
 import {
   Upload,
   X,
@@ -89,7 +89,20 @@ interface AssessmentFormCardProps {
   onCancel: () => void;
   onEdit?: () => void;
   isSubmitting: boolean;
-  onProceedToFindings?: () => void;
+  onProceedToQuestionnaire?: () => void;
+}
+
+// Parse comma-separated departments into array
+function parseDepartments(deptString: string): string[] {
+  return deptString
+    .split(",")
+    .map((d) => d.trim())
+    .filter((d) => d.length > 0);
+}
+
+// Convert department array back to comma-separated string
+function stringifyDepartments(depts: string[]): string {
+  return depts.join(", ");
 }
 
 function formatFileSize(bytes: number): string {
@@ -119,13 +132,20 @@ export function AssessmentFormCard({
   onCancel,
   onEdit,
   isSubmitting,
-  onProceedToFindings,
+  onProceedToQuestionnaire,
 }: AssessmentFormCardProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [departments, setDepartments] = useState<string[]>(defaultDepartments);
   const [showDepartmentDropdown, setShowDepartmentDropdown] = useState(false);
   const [newDepartment, setNewDepartment] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  // Parse selected departments from comma-separated string
+  const [selectedDepartments, setSelectedDepartments] = useState<string[]>([]);
+
+  // Sync selected departments when formData changes (e.g., on load from storage)
+  useEffect(() => {
+    setSelectedDepartments(parseDepartments(formData.department));
+  }, [formData.department]);
 
   const handleInputChange = (
     e: ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>,
@@ -133,18 +153,26 @@ export function AssessmentFormCard({
     onFieldChange(e.target.name, e.target.value);
   };
 
-  const handleDepartmentSelect = (dept: string) => {
-    onFieldChange("department", dept);
-    setShowDepartmentDropdown(false);
+  const handleDepartmentToggle = (dept: string, checked: boolean) => {
+    let updated: string[];
+    if (checked) {
+      updated = [...selectedDepartments, dept];
+    } else {
+      updated = selectedDepartments.filter((d) => d !== dept);
+    }
+    setSelectedDepartments(updated);
+    onFieldChange("department", stringifyDepartments(updated));
   };
 
   const handleAddDepartment = () => {
     if (newDepartment.trim() && !departments.includes(newDepartment.trim())) {
       const trimmedDept = newDepartment.trim();
       setDepartments((prev) => [...prev, trimmedDept]);
-      onFieldChange("department", trimmedDept);
+      // Auto-select the newly added department
+      const updated = [...selectedDepartments, trimmedDept];
+      setSelectedDepartments(updated);
+      onFieldChange("department", stringifyDepartments(updated));
       setNewDepartment("");
-      setShowDepartmentDropdown(false);
     }
   };
 
@@ -354,84 +382,71 @@ export function AssessmentFormCard({
           )}
         </div>
 
-        {/* Department - Creatable Dropdown */}
+        {/* Department - Multi-select Checkboxes */}
         <div className="space-y-2">
           <label className="text-xs font-medium text-slate-400 uppercase tracking-wider">
-            Department <span className="text-rose-500">*</span>
+            Department(s) <span className="text-rose-500">*</span>
           </label>
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => {
-                if (!readOnly) setShowDepartmentDropdown(!showDepartmentDropdown);
-              }}
-              disabled={readOnly}
-              className={cn(
-                "w-full bg-black/40 border rounded-lg px-3 py-2.5 text-left flex items-center justify-between text-white text-sm focus:outline-none focus:ring-1 transition-all",
-                "disabled:opacity-60 disabled:cursor-not-allowed",
-                formErrors.department
-                  ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/50"
-                  : "border-white/10 focus:border-purple-500/50 focus:ring-purple-500/50",
-                !formData.department && "text-slate-500",
-              )}
-            >
-              <span>
-                {formData.department || "Select or add department"}
-              </span>
-              <ChevronDown
-                className={cn(
-                  "w-4 h-4 text-slate-500 transition-transform",
-                  showDepartmentDropdown && "rotate-180",
-                )}
-              />
-            </button>
-
-            {showDepartmentDropdown && !readOnly && (
-              <div className="absolute z-[200] w-full mt-1 bg-[#0f1016] border border-white/10 rounded-lg shadow-xl max-h-60 overflow-y-auto">
-                {/* Add new department input */}
-                <div className="p-2 border-b border-white/10">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      value={newDepartment}
-                      onChange={(e) => setNewDepartment(e.target.value)}
-                      placeholder="Add new department..."
-                      className="flex-1 bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50"
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          handleAddDepartment();
-                        }
-                      }}
-                    />
-                    <button
-                      type="button"
-                      onClick={handleAddDepartment}
-                      disabled={!newDepartment.trim()}
-                      className="p-2 bg-purple-600 text-white rounded-lg hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                    >
-                      <Plus className="h-4 w-4" />
-                    </button>
-                  </div>
-                </div>
-
-                {/* Department options */}
-                {departments.map((dept) => (
-                  <button
-                    key={dept}
-                    type="button"
-                    onClick={() => handleDepartmentSelect(dept)}
-                    className={cn(
-                      "w-full px-4 py-2 text-left text-sm hover:bg-white/5 flex items-center justify-between text-slate-300",
-                      formData.department === dept &&
-                        "bg-purple-500/10 text-purple-300",
-                    )}
+          <div className="space-y-2">
+            {/* Department checkboxes */}
+            <div className="space-y-2 max-h-48 overflow-y-auto border border-white/10 rounded-lg p-3 bg-black/20">
+              {departments.map((dept) => (
+                <div key={dept} className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id={`dept-${dept}`}
+                    checked={selectedDepartments.includes(dept)}
+                    onChange={(e) => handleDepartmentToggle(dept, e.target.checked)}
+                    disabled={readOnly}
+                    className="h-4 w-4 rounded border-white/10 bg-black/40 text-purple-500 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed accent-purple-500"
+                  />
+                  <label
+                    htmlFor={`dept-${dept}`}
+                    className="text-sm text-slate-300 cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed flex-1"
                   >
-                    <span>{dept}</span>
-                    {formData.department === dept && (
-                      <Check className="h-4 w-4" />
-                    )}
-                  </button>
+                    {dept}
+                  </label>
+                </div>
+              ))}
+            </div>
+
+            {/* Add new department */}
+            {!readOnly && (
+              <div className="flex items-center gap-2 pt-2">
+                <input
+                  type="text"
+                  value={newDepartment}
+                  onChange={(e) => setNewDepartment(e.target.value)}
+                  placeholder="Add new department..."
+                  className="flex-1 bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddDepartment();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={handleAddDepartment}
+                  disabled={!newDepartment.trim()}
+                  className="p-2 bg-purple-600 text-white rounded-lg hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  <Plus className="h-4 w-4" />
+                </button>
+              </div>
+            )}
+
+            {/* Display selected departments in read-only mode */}
+            {readOnly && selectedDepartments.length > 0 && (
+              <div className="flex flex-wrap gap-2 pt-2">
+                {selectedDepartments.map((dept) => (
+                  <span
+                    key={dept}
+                    className="px-2 py-1 bg-purple-500/10 text-purple-300 text-xs rounded border border-purple-500/20"
+                  >
+                    {dept}
+                  </span>
                 ))}
               </div>
             )}
@@ -571,13 +586,13 @@ export function AssessmentFormCard({
           >
             {readOnly ? "Back" : "Cancel"}
           </button>
-          {readOnly && onProceedToFindings && (
+          {readOnly && onProceedToQuestionnaire && (
             <button
               type="button"
-              onClick={onProceedToFindings}
+              onClick={onProceedToQuestionnaire}
               className="flex items-center gap-2 px-6 py-2 text-sm font-medium bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white rounded-lg shadow-lg shadow-purple-900/20 transition-all"
             >
-              Proceed to Findings
+              Proceed to Questionnaire
               <ArrowRight className="w-4 h-4" />
             </button>
           )}

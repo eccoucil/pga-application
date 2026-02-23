@@ -61,6 +61,7 @@ async def generate_with_criteria_stream(
             compliance_concerns=request.compliance_concerns,
             controls_to_skip=request.controls_to_skip,
             assessment_id=request.assessment_id,
+            questions_per_control=request.questions_per_control,
         ),
         media_type="text/event-stream",
         headers={

@@ -109,7 +109,7 @@ export default function ControlsPage() {
         setClauses(clausesData.clauses)
         setExpandedClauses(new Set(clausesData.clauses.map((c: ManagementClause) => c.clause_id)))
       } catch (err) {
-        setError("Failed to load controls data")
+        setError(`Failed to load controls: ${err instanceof Error ? err.message : 'Unknown error'}`)
         console.error(err)
       } finally {
         setLoading(false)

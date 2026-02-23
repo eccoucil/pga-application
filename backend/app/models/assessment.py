@@ -32,7 +32,10 @@ class OrganizationInfo(BaseModel):
     web_domain: Optional[str] = Field(
         None, description="Organization's web domain for discovery"
     )
-    department: str = Field(..., description="Department requesting assessment")
+    department: str = Field(
+        ...,
+        description="Department(s) requesting assessment (comma-separated for multiple departments)",
+    )
     scope_statement_isms: str = Field(
         ...,
         min_length=10,

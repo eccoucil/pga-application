@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # Anthropic (for Claude Sonnet 4 reasoning)
     anthropic_api_key: Optional[str] = None
     claude_model: str = "claude-sonnet-4-20250514"
+    # Question generation model (can be overridden for speed: claude-3-5-haiku-20241022 is 3-5x faster but lower quality)
+    # NOTE: Haiku is significantly faster but produces lower-quality questions. Use only for quick iterations.
+    question_generation_model: Optional[str] = None  # Defaults to claude_model if not set
 
     # Neo4j (optional - knowledge graph)
     neo4j_uri: str = "bolt://localhost:7687"

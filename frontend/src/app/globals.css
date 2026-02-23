@@ -66,14 +66,25 @@
   --rdp-day-width: 2rem;
   --rdp-selected-font: inherit;
   color: #e2e8f0;
+  position: relative;
+}
+
+/* Nav container: absolute overlay spanning the top for prev/next buttons */
+.rdp-custom .rdp-nav {
+  position: absolute;
+  top: 0.75rem;
+  left: 0.25rem;
+  right: 0.25rem;
+  display: flex;
+  justify-content: space-between;
+  z-index: 1;
 }
 
 .rdp-custom .rdp-month_caption {
   display: flex;
   justify-content: center;
   align-items: center;
-  padding: 0.25rem 0;
-  position: relative;
+  padding: 0.25rem 2.5rem;
 }
 
 .rdp-custom .rdp-caption_label {
@@ -84,9 +95,6 @@
 
 .rdp-custom .rdp-button_previous,
 .rdp-custom .rdp-button_next {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -104,14 +112,6 @@
 .rdp-custom .rdp-button_next:hover {
   background: #1e293b;
   color: #f1f5f9;
-}
-
-.rdp-custom .rdp-button_previous {
-  left: 0.25rem;
-}
-
-.rdp-custom .rdp-button_next {
-  right: 0.25rem;
 }
 
 .rdp-custom .rdp-weekday {

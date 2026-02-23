@@ -2,7 +2,7 @@
 
 import { useState, useEffect, FormEvent, ChangeEvent } from "react"
 import { X, AlertCircle, Calendar as CalendarIcon } from "lucide-react"
-import { format } from "date-fns"
+import { format, addDays } from "date-fns"
 import type { Project, CreateProjectData, UpdateProjectData, FRAMEWORK_OPTIONS } from "@/types/project"
 import { Calendar } from "@/components/ui/calendar"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
@@ -63,7 +63,7 @@ export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalP
         name: "",
         description: "",
         framework: [],
-        start_date: "",
+        start_date: format(new Date(), "yyyy-MM-dd"),
         end_date: "",
         status: "started",
       })
@@ -83,7 +83,7 @@ export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalP
     }
 
     if (formData.start_date && formData.end_date) {
-      if (new Date(formData.end_date) < new Date(formData.start_date)) {
+      if (new Date(formData.end_date) <= new Date(formData.start_date)) {
         newErrors.end_date = "End date must be after start date"
       }
     }
@@ -245,13 +245,19 @@ export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalP
                     mode="single"
                     selected={formData.start_date ? new Date(formData.start_date) : undefined}
                     onSelect={(date) => {
-                      setFormData((prev) => ({
-                        ...prev,
-                        start_date: date ? format(date, "yyyy-MM-dd") : "",
-                      }))
+                      const newStartDate = date ? format(date, "yyyy-MM-dd") : ""
+                      setFormData((prev) => {
+                        const shouldClearEnd = prev.end_date && newStartDate && prev.end_date <= newStartDate
+                        return {
+                          ...prev,
+                          start_date: newStartDate,
+                          ...(shouldClearEnd ? { end_date: "" } : {}),
+                        }
+                      })
                       setStartDateOpen(false)
                     }}
-                    initialFocus
+                    disabled={{ before: new Date() }}
+                    autoFocus
                   />
                 </PopoverContent>
               </Popover>
@@ -297,7 +303,13 @@ export function ProjectModal({ isOpen, onClose, onSave, project }: ProjectModalP
                         setErrors((prev) => ({ ...prev, end_date: undefined }))
                       }
                     }}
-                    initialFocus
+                    disabled={{
+                      before: formData.start_date
+                        ? addDays(new Date(formData.start_date), 1)
+                        : new Date(),
+                    }}
+                    defaultMonth={formData.start_date ? new Date(formData.start_date) : undefined}
+                    autoFocus
                   />
                 </PopoverContent>
               </Popover>

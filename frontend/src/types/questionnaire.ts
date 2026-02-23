@@ -41,18 +41,29 @@ export interface QuestionnaireComplete {
   criteria_summary: string;
 }
 
+/** Returned when the conversational agent triggers batch generation. */
+export interface GenerationRedirect {
+  session_id: string;
+  type: "generation_redirect";
+  criteria: GenerateWithCriteriaRequest;
+}
+
 /** Discriminated union — narrows on `type` field. */
-export type QuestionnaireResponse = AgentQuestion | QuestionnaireComplete;
+export type QuestionnaireResponse =
+  | AgentQuestion
+  | QuestionnaireComplete
+  | GenerationRedirect;
 
 /** Structured criteria for the wizard flow (batch generation). */
 export interface GenerateWithCriteriaRequest {
   project_id: string;
   assessment_id?: string | null;
-  maturity_level: "first_time_audit" | "recurring_assessment" | "mature_isms";
-  question_depth: "high_level_overview" | "balanced" | "detailed_technical";
+  maturity_level: string;
+  question_depth: string;
   priority_domains: string[];
   compliance_concerns?: string | null;
   controls_to_skip?: string | null;
+  questions_per_control?: number | null;
 }
 
 /** Summary row from GET /questionnaire/sessions. */

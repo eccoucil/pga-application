@@ -28,6 +28,7 @@ from app.config import get_settings
 from app.models.questionnaire import (
     AgentQuestion,
     ControlQuestions,
+    GenerationRedirect,
     QuestionnaireComplete,
     QuestionnaireResponse,
 )
@@ -188,27 +189,31 @@ class QuestionnaireAgent:
     def __init__(self) -> None:
         settings = get_settings()
         self._model = settings.claude_model or DEFAULT_MODEL
-        
+        # Use dedicated model for question generation if configured, otherwise use main model
+        # NOTE: For speed, you can set question_generation_model to "claude-3-5-haiku-20241022"
+        # (3-5x faster but lower quality). Production should use Sonnet or Opus.
+        self._question_gen_model = settings.question_generation_model or self._model
+
         # Diagnostic logging
         key_exists = bool(settings.anthropic_api_key)
         key_len = len(settings.anthropic_api_key) if settings.anthropic_api_key else 0
         logger.info(f"Initializing QuestionnaireAgent with model: {self._model}")
+        logger.info(f"Question generation model: {self._question_gen_model}")
         logger.info(f"Anthropic API key exists: {key_exists}, length: {key_len}")
-        
+
         # Disable HTTP/2 to avoid connection issues on some networks (common Mac issue)
         # Use a custom httpx client for more control
         http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(600.0, connect=30.0, read=570.0),
-            http2=False, # Force HTTP/1.1
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)
+            http2=False,  # Force HTTP/1.1
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
-        
+
         self._client = anthropic.AsyncAnthropic(
-            api_key=settings.anthropic_api_key,
-            http_client=http_client
+            api_key=settings.anthropic_api_key, http_client=http_client
         )
         self._swarm = QuestionGenerationSwarm(
-            client=self._client, model=self._model
+            client=self._client, model=self._question_gen_model
         )
 
     # ------------------------------------------------------------------
@@ -281,7 +286,9 @@ class QuestionnaireAgent:
         if assessment_id:
             existing = await self._get_existing_session(assessment_id)
             if existing:
-                logger.info(f"Returning cached questionnaire for assessment {assessment_id}")
+                logger.info(
+                    f"Returning cached questionnaire for assessment {assessment_id}"
+                )
                 return existing
 
         context = await self._fetch_project_context(project_id)
@@ -305,7 +312,7 @@ class QuestionnaireAgent:
                 total_controls=0,
                 total_questions=0,
                 generation_time_ms=int(time.time() * 1000) - started_at,
-                criteria_summary="No controls selected"
+                criteria_summary="No controls selected",
             )
 
         criteria_summary = self._build_criteria_summary(
@@ -347,7 +354,11 @@ class QuestionnaireAgent:
 
         # Persist all results
         await self._persist_results(
-            session, all_generated_controls, total_questions, elapsed_ms, criteria_summary
+            session,
+            all_generated_controls,
+            total_questions,
+            elapsed_ms,
+            criteria_summary,
         )
 
         return QuestionnaireComplete(
@@ -369,6 +380,7 @@ class QuestionnaireAgent:
         compliance_concerns: str | None = None,
         controls_to_skip: str | None = None,
         assessment_id: str | None = None,
+        questions_per_control: int | None = None,
     ):
         """Stream SSE events as batches complete during question generation."""
         session_id = str(uuid.uuid4())
@@ -426,12 +438,17 @@ class QuestionnaireAgent:
             "priority_domains": priority_domains,
             "compliance_concerns": compliance_concerns,
             "controls_to_skip": controls_to_skip,
+            "questions_per_control": questions_per_control,
         }
 
         from app.services.question_swarm import SwarmResult
+
         swarm_result = SwarmResult()
         async for event in self._swarm.generate_stream(
-            all_controls, context, criteria_dict, session_id,
+            all_controls,
+            context,
+            criteria_dict,
+            session_id,
             result_out=swarm_result,
         ):
             yield event
@@ -443,7 +460,11 @@ class QuestionnaireAgent:
         session.status = "completed"
 
         await self._persist_results(
-            session, all_generated_controls, total_questions, elapsed_ms, criteria_summary
+            session,
+            all_generated_controls,
+            total_questions,
+            elapsed_ms,
+            criteria_summary,
         )
 
         complete = QuestionnaireComplete(
@@ -493,7 +514,10 @@ class QuestionnaireAgent:
                 max_tokens=CRITERIA_MAX_TOKENS,
                 system=batch_system_prompt,
                 messages=[
-                    {"role": "user", "content": "Generate the compliance assessment questions for these specific controls."}
+                    {
+                        "role": "user",
+                        "content": "Generate the compliance assessment questions for these specific controls.",
+                    }
                 ],
             )
 
@@ -503,7 +527,9 @@ class QuestionnaireAgent:
                     text += block.text
 
             batch_controls = self._parse_questions(text, session.session_id)
-            logger.info(f"Batch {batch_num} complete: {len(batch_controls)} controls, {sum(len(c.questions) for c in batch_controls)} questions")
+            logger.info(
+                f"Batch {batch_num} complete: {len(batch_controls)} controls, {sum(len(c.questions) for c in batch_controls)} questions"
+            )
 
             if on_progress:
                 on_progress(batch_index, len(batch_controls))
@@ -595,7 +621,7 @@ Organization: {org_name} ({industry})
 {batch_controls_text}
 
 ## Assessment Criteria
-Maturity Level: {maturity_level.replace('_', ' ').title()}
+Maturity Level: {maturity_level.replace("_", " ").title()}
 Question Depth: {q_count}
 Complexity Guidance: {maturity_guidance}{priority_section}{concerns_section}{skip_section}
 
@@ -643,9 +669,7 @@ Ensure questions are specific to {org_name}'s context."""
             f"Session {session.session_id}: stop_reason={response.stop_reason}, "
             f"output_tokens={response.usage.output_tokens}"
         )
-        session.messages.append(
-            {"role": "assistant", "content": response.content}
-        )
+        session.messages.append({"role": "assistant", "content": response.content})
         return response
 
     async def continue_session(
@@ -699,6 +723,8 @@ Ensure questions are specific to {org_name}'s context."""
         try:
             result = await sb.table(table_name).select("*").execute()
             data = result.data or []
+            if not data:
+                logger.warning(f"Table {table_name} returned 0 rows — was migration 017 executed?")
             _controls_cache[table_name] = (now, data)
             logger.info(f"Cached {len(data)} rows from {table_name}")
             return data
@@ -710,18 +736,30 @@ Ensure questions are specific to {org_name}'s context."""
                 return data
             return []
 
-    async def _fetch_project_context(self, project_id: str) -> dict:
-        """Fetch all context needed for question generation in parallel."""
+    async def _fetch_project_context(
+        self, project_id: str, *, client_id: str | None = None
+    ) -> dict:
+        """Fetch all context needed for question generation in parallel.
+
+        Args:
+            project_id: The project to fetch context for.
+            client_id: Optional pre-known client ID. When provided, the client
+                info fetch runs in parallel with the project fetch (saves
+                100-300ms). Falls back to extracting from the project row.
+        """
+        t0 = time.perf_counter()
         from app.db.supabase import get_async_supabase_client_async
 
         sb = await get_async_supabase_client_async()
 
-        # Phase 1: Fetch project + project-scoped data in parallel
-        (
-            project_res,
-            findings_res,
-            crawl_res,
-        ) = await asyncio.gather(
+        # Helper for optional gather slots
+        async def _noop():
+            return None
+
+        # Phase 1: ALL non-dependent fetches in parallel
+        # When client_id is known upfront, client + doc metadata run alongside
+        # project/findings/crawl instead of waiting for the project row.
+        gather_tasks: list = [
             sb.table("projects").select("*").eq("id", project_id).execute(),
             sb.table("gap_analysis_findings")
             .select("*")
@@ -733,8 +771,26 @@ Ensure questions are specific to {org_name}'s context."""
             .order("created_at", desc=True)
             .limit(1)
             .execute(),
-            return_exceptions=True,
-        )
+            (
+                sb.table("clients").select("*").eq("id", client_id).execute()
+                if client_id
+                else _noop()
+            ),
+            sb.table("project_documents")
+            .select("filename, format, word_count")
+            .eq("project_id", project_id)
+            .execute(),
+        ]
+
+        (
+            project_res,
+            findings_res,
+            crawl_res,
+            client_res,
+            docs_res,
+        ) = await asyncio.gather(*gather_tasks, return_exceptions=True)
+
+        phase1_ms = int((time.perf_counter() - t0) * 1000)
 
         context: dict[str, Any] = {"project_id": project_id}
 
@@ -756,13 +812,28 @@ Ensure questions are specific to {org_name}'s context."""
 
         frameworks = context["selected_frameworks"]
 
-        # Phase 2: Fetch client info (fresh) + framework controls (cached)
-        client_id = context.get("client_id", "")
-        if client_id:
+        # Client info — use Phase 1 result or fall back to sequential fetch
+        resolved_client_id = client_id or context.get("client_id", "")
+        if (
+            client_id
+            and not isinstance(client_res, Exception)
+            and client_res
+            and client_res.data
+        ):
+            client = client_res.data[0]
+            context["organization_name"] = client.get("name", "")
+            context["industry"] = client.get("industry", "")
+        elif resolved_client_id and not client_id:
+            # client_id wasn't known upfront — fetch now (sequential fallback)
             try:
-                client_res = await sb.table("clients").select("*").eq("id", client_id).execute()
-                if client_res.data:
-                    client = client_res.data[0]
+                fallback_res = (
+                    await sb.table("clients")
+                    .select("*")
+                    .eq("id", resolved_client_id)
+                    .execute()
+                )
+                if fallback_res.data:
+                    client = fallback_res.data[0]
                     context["organization_name"] = client.get("name", "")
                     context["industry"] = client.get("industry", "")
             except Exception as e:
@@ -783,43 +854,57 @@ Ensure questions are specific to {org_name}'s context."""
             context["business_context"] = {}
             context["digital_assets"] = []
 
-        # Framework controls (cached — these rarely change)
-        if not frameworks or "ISO 27001:2022" in frameworks:
-            context["iso_controls"] = await self._fetch_cached_controls("iso_requirements", sb)
-        else:
-            context["iso_controls"] = []
+        # Document metadata (from Phase 1 gather)
+        if not isinstance(docs_res, Exception) and docs_res and docs_res.data:
+            context["project_documents"] = docs_res.data
 
-        if not frameworks or "BNM RMIT" in frameworks:
-            context["bnm_controls"] = await self._fetch_cached_controls("bnm_rmit_requirements", sb)
-        else:
-            context["bnm_controls"] = []
+        # Phase 2: Framework controls in parallel (cached — these rarely change)
+        t_fw = time.perf_counter()
+        iso_task = (
+            self._fetch_cached_controls("iso_requirements", sb)
+            if not frameworks or "ISO 27001:2022" in frameworks
+            else _noop()
+        )
+        bnm_task = (
+            self._fetch_cached_controls("bnm_rmit_requirements", sb)
+            if not frameworks or "BNM RMIT" in frameworks
+            else _noop()
+        )
+        iso_controls, bnm_controls = await asyncio.gather(iso_task, bnm_task)
+        context["iso_controls"] = iso_controls or []
+        context["bnm_controls"] = bnm_controls or []
+        phase2_ms = int((time.perf_counter() - t_fw) * 1000)
 
-        # Document metadata from Supabase (optional, non-blocking)
-        try:
-            docs_res = (
-                await sb.table("project_documents")
-                .select("filename, format, word_count")
-                .eq("project_id", project_id)
-                .execute()
-            )
-            if docs_res.data:
-                context["project_documents"] = docs_res.data
-        except Exception as e:
-            logger.warning(f"Document metadata fetch failed (non-critical): {e}")
+        # Phase 3: pgvector search — non-blocking with 3s timeout
+        t_vec = time.perf_counter()
+        vec_client_id = resolved_client_id
+        if vec_client_id:
+            try:
+                from app.services.supabase_vector_service import (
+                    get_supabase_vector_service,
+                )
 
-        # Document chunks via pgvector (optional, non-blocking)
-        try:
-            from app.services.supabase_vector_service import get_supabase_vector_service
+                vector_svc = get_supabase_vector_service()
+                chunks = await asyncio.wait_for(
+                    vector_svc.search_client_extractions(
+                        client_id=vec_client_id,
+                        query="compliance policy information security",
+                        limit=10,
+                    ),
+                    timeout=3.0,
+                )
+                context["document_chunks"] = chunks
+            except asyncio.TimeoutError:
+                logger.warning("pgvector search timed out after 3s (non-critical)")
+            except Exception as e:
+                logger.warning(f"pgvector search failed (non-critical): {e}")
+        vec_ms = int((time.perf_counter() - t_vec) * 1000)
 
-            vector_svc = get_supabase_vector_service()
-            chunks = await vector_svc.search_client_extractions(
-                client_id=client_id,
-                query="compliance policy information security",
-                limit=10,
-            )
-            context["document_chunks"] = chunks
-        except Exception as e:
-            logger.warning(f"pgvector search failed (non-critical): {e}")
+        total_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info(
+            f"Context fetch took {total_ms}ms "
+            f"(phase1={phase1_ms}ms, frameworks={phase2_ms}ms, vector={vec_ms}ms)"
+        )
 
         return context
 
@@ -848,7 +933,9 @@ Ensure questions are specific to {org_name}'s context."""
             biz_summary = json.dumps(business_ctx, default=str)[:2000]
 
         # Findings summary
-        findings_summary = f"{len(findings)} existing findings" if findings else "No existing findings"
+        findings_summary = (
+            f"{len(findings)} existing findings" if findings else "No existing findings"
+        )
 
         scope_stmt = context.get("scope_statement_isms", "")
 
@@ -856,14 +943,14 @@ Ensure questions are specific to {org_name}'s context."""
 
 Goal: Generate targeted, actionable compliance assessment questions specific to the organization's context, industry, and regulatory landscape.
 
-Backstory: You have 15+ years of experience conducting compliance audits for financial institutions across Southeast Asia, specializing in {' and '.join(frameworks) if frameworks else 'BNM RMIT and ISO 27001:2022'}. You understand that generic questionnaires produce generic results — the best assessments are tailored to the organization's specific risks, maturity, and operational context.
+Backstory: You have 15+ years of experience conducting compliance audits for financial institutions across Southeast Asia, specializing in {" and ".join(frameworks) if frameworks else "BNM RMIT and ISO 27001:2022"}. You understand that generic questionnaires produce generic results — the best assessments are tailored to the organization's specific risks, maturity, and operational context.
 
 ## Project Context
 Organization: {org_name} ({industry})
-Frameworks: {', '.join(frameworks) if frameworks else 'Not specified'}
-Business Context: {biz_summary or 'Not available'}
-ISMS Scope: {scope_stmt or 'Not specified'}
-Documents Uploaded: {len(doc_names)} ({', '.join(doc_names[:10]) if doc_names else 'none'})
+Frameworks: {", ".join(frameworks) if frameworks else "Not specified"}
+Business Context: {biz_summary or "Not available"}
+ISMS Scope: {scope_stmt or "Not specified"}
+Documents Uploaded: {len(doc_names)} ({", ".join(doc_names[:10]) if doc_names else "none"})
 Existing Findings: {findings_summary}
 
 ## Framework Controls
@@ -900,7 +987,7 @@ IMPORTANT: Always end the conversation by calling generateQuestionnaire. Never t
             bnm_controls = context.get("bnm_controls", [])
             if bnm_controls:
                 parts.append("\n### BNM RMIT Controls")
-                for c in bnm_controls[:100]: # Hard limit to 100
+                for c in bnm_controls[:100]:  # Hard limit to 100
                     ref = c.get("reference_id", "")
                     title = c.get("subsection_title") or c.get("section_title", "")
                     desc = c.get("requirement_text", "")[:150]
@@ -965,7 +1052,9 @@ IMPORTANT: Always end the conversation by calling generateQuestionnaire. Never t
                 "with business processes, and proactive threat management."
             ),
         }
-        maturity_guidance = maturity_map.get(maturity_level, maturity_map["recurring_assessment"])
+        maturity_guidance = maturity_map.get(
+            maturity_level, maturity_map["recurring_assessment"]
+        )
 
         # Priority domains section
         priority_section = ""
@@ -1000,21 +1089,21 @@ IMPORTANT: Always end the conversation by calling generateQuestionnaire. Never t
 
 Goal: Generate targeted, actionable compliance assessment questions specific to the organization's context, industry, and regulatory landscape.
 
-Backstory: You have 15+ years of experience conducting compliance audits for financial institutions across Southeast Asia, specializing in {' and '.join(frameworks) if frameworks else 'BNM RMIT and ISO 27001:2022'}. You understand that generic questionnaires produce generic results — the best assessments are tailored to the organization's specific risks, maturity, and operational context.
+Backstory: You have 15+ years of experience conducting compliance audits for financial institutions across Southeast Asia, specializing in {" and ".join(frameworks) if frameworks else "BNM RMIT and ISO 27001:2022"}. You understand that generic questionnaires produce generic results — the best assessments are tailored to the organization's specific risks, maturity, and operational context.
 
 ## Project Context
 Organization: {org_name} ({industry})
-Frameworks: {', '.join(frameworks) if frameworks else 'Not specified'}
-Business Context: {biz_summary or 'Not available'}
-ISMS Scope: {scope_stmt or 'Not specified'}
-Documents Uploaded: {len(doc_names)} ({', '.join(doc_names[:10]) if doc_names else 'none'})
+Frameworks: {", ".join(frameworks) if frameworks else "Not specified"}
+Business Context: {biz_summary or "Not available"}
+ISMS Scope: {scope_stmt or "Not specified"}
+Documents Uploaded: {len(doc_names)} ({", ".join(doc_names[:10]) if doc_names else "none"})
 Existing Findings: {findings_summary}
 
 ## Framework Controls
 {controls_text}
 
 ## Assessment Criteria
-Maturity Level: {maturity_level.replace('_', ' ').title()}
+Maturity Level: {maturity_level.replace("_", " ").title()}
 Question Depth: {q_count}
 Complexity Guidance: {maturity_guidance}{priority_section}{concerns_section}{skip_section}
 
@@ -1134,7 +1223,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
                         return True
                     # Numeric matching: "Sections 8-9" or "Section 8"
                     if section_num is not None:
-                        nums = re.findall(r'\d+', label)
+                        nums = re.findall(r"\d+", label)
                         if str(section_num) in nums:
                             return True
                 return False
@@ -1155,9 +1244,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
         wait=wait_exponential(multiplier=1, min=2, max=30),
         reraise=True,
     )
-    async def _call_agent(
-        self, session: QuestionnaireSession
-    ) -> QuestionnaireResponse:
+    async def _call_agent(self, session: QuestionnaireSession) -> QuestionnaireResponse:
         """Call Claude and handle tool_use vs end_turn."""
         response = await self._client.messages.create(
             model=self._model,
@@ -1168,9 +1255,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
         )
 
         # Append assistant response to conversation history
-        session.messages.append(
-            {"role": "assistant", "content": response.content}
-        )
+        session.messages.append({"role": "assistant", "content": response.content})
 
         # Check if Claude wants to use a tool
         if response.stop_reason == "tool_use":
@@ -1191,47 +1276,87 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
                 )
 
             if tool_block and tool_block.name == "generateQuestionnaire":
-                # Extract criteria from tool input and run batch generation
+                # Return a redirect so the frontend can use SSE streaming
                 criteria = tool_block.input
                 logger.info(
                     f"Session {session.session_id}: agent called generateQuestionnaire, "
-                    f"starting batch generation with criteria: {criteria}"
+                    f"redirecting to SSE streaming with criteria: {criteria}"
                 )
-                return await self._run_batch_generation(session, criteria)
+                return GenerationRedirect(
+                    session_id=session.session_id,
+                    criteria={
+                        "project_id": session.project_id,
+                        "assessment_id": session.assessment_id,
+                        "maturity_level": criteria.get("maturity_level", "developing"),
+                        "question_depth": criteria.get("question_depth", "balanced"),
+                        "priority_domains": criteria.get("priority_domains", []),
+                        "compliance_concerns": criteria.get("compliance_concerns"),
+                        "questions_per_control": criteria.get("questions_per_control"),
+                    },
+                )
 
         # If it's not a tool use, check if it contains JSON questions
         text = ""
         for block in response.content:
             if hasattr(block, "text"):
                 text += block.text
-        
+
         if "[" in text and "]" in text and "control_id" in text:
             # end_turn — agent is done, extract generated questions
             return await self._handle_completion(session, response)
-        
+
         # Fallback: if it's just text, treat it as a question to the user
         # but without tool metadata (manual fallback)
         await self._persist_active_session(session)
         return AgentQuestion(
             session_id=session.session_id,
-            question=text.strip() or "I need more information to generate the questions. Could you please clarify your requirements?",
-            context="The agent provided a text response instead of using a tool or generating JSON."
+            question=text.strip()
+            or "I need more information to generate the questions. Could you please clarify your requirements?",
+            context="The agent provided a text response instead of using a tool or generating JSON.",
         )
 
     # ------------------------------------------------------------------
     # Batch generation from conversational criteria
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _natural_sort_key(control_id: str) -> tuple:
+        """Convert a control ID like '4.1', 'A.5.10', 'S 8.2' to a sortable key.
+
+        This ensures proper numeric ordering: 4.1, 4.2, 4.10 instead of 4.1, 4.10, 4.2
+        """
+        import re
+
+        # Remove framework prefix (e.g., 'S ', 'G ')
+        control_id = control_id.lstrip("SG ").strip()
+
+        # Split by dots and convert to integers where possible
+        parts = []
+        for part in control_id.split("."):
+            # Try to convert to int for numeric sorting
+            try:
+                parts.append((0, int(part)))  # 0 = numeric, for sorting before strings
+            except ValueError:
+                # Keep as string with marker 1 (sorts after numbers)
+                parts.append((1, part.lower()))
+        return tuple(parts)
+
     def _build_controls_list(self, context: dict) -> list[dict]:
         """Build a unified controls list from project context.
 
         Shared by both ``generate_with_criteria`` (wizard flow) and
         ``_run_batch_generation`` (conversational flow).
+
+        Controls are sorted in natural order:
+        - Management clauses: 4.1, 4.2, 4.3, ..., 4.4, 5.1, 5.2, ..., 10.2
+        - Annex A controls: A.5.1, A.5.2, ..., A.8.34
         """
         iso_controls = context.get("iso_controls", [])
         bnm_controls = context.get("bnm_controls", [])
 
         all_controls: list[dict] = []
+
+        # Add ISO controls (management clauses first, then Annex A)
         for c in iso_controls:
             identifier = c.get("identifier", "")
             parts = identifier.split(".")
@@ -1239,22 +1364,46 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
                 domain = f"A.{parts[1]}"
             else:
                 domain = identifier.split(".")[0] if identifier else ""
-            all_controls.append({
-                "id": identifier,
-                "title": c.get("title"),
-                "framework": "ISO 27001:2022",
-                "desc": c.get("description", "")[:200],
-                "domain": domain,
-            })
+            all_controls.append(
+                {
+                    "id": identifier,
+                    "title": c.get("title"),
+                    "framework": "ISO 27001:2022",
+                    "desc": c.get("description", "")[:200],
+                    "domain": domain,
+                    "clause_type": c.get(
+                        "clause_type", "domain"
+                    ),  # 'management' or 'domain'
+                }
+            )
+
+        # Add BNM RMIT controls
         for c in bnm_controls:
-            all_controls.append({
-                "id": c.get("reference_id"),
-                "title": c.get("subsection_title") or c.get("section_title", ""),
-                "framework": "BNM RMIT",
-                "desc": c.get("requirement_text", "")[:200],
-                "section_title": c.get("section_title", ""),
-                "section_number": c.get("section_number"),
-            })
+            all_controls.append(
+                {
+                    "id": c.get("reference_id"),
+                    "title": c.get("subsection_title") or c.get("section_title", ""),
+                    "framework": "BNM RMIT",
+                    "desc": c.get("requirement_text", "")[:200],
+                    "section_title": c.get("section_title", ""),
+                    "section_number": c.get("section_number"),
+                }
+            )
+
+        # Sort: management clauses (4-10) first, then Annex A (A.5-A.8), then BNM RMIT (8-18)
+        def sort_key(control):
+            ctrl_id = control["id"]
+            # Management clauses: sort by number (4, 5, 6, ..., 10)
+            if control.get("clause_type") == "management":
+                return (0, self._natural_sort_key(ctrl_id))
+            # Annex A: sort after management
+            elif ctrl_id.startswith("A."):
+                return (1, self._natural_sort_key(ctrl_id))
+            # BNM RMIT: sort last
+            else:
+                return (2, self._natural_sort_key(ctrl_id))
+
+        all_controls.sort(key=sort_key)
         return all_controls
 
     @staticmethod
@@ -1371,9 +1520,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
     # Parsing
     # ------------------------------------------------------------------
 
-    def _parse_questions(
-        self, text: str, session_id: str
-    ) -> list[ControlQuestions]:
+    def _parse_questions(self, text: str, session_id: str) -> list[ControlQuestions]:
         """Extract JSON questions array from Claude's final response."""
         return parse_questions(text, session_id)
 
@@ -1407,7 +1554,9 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
     # Persistence
     # ------------------------------------------------------------------
 
-    async def _get_existing_session(self, assessment_id: str) -> QuestionnaireComplete | None:
+    async def _get_existing_session(
+        self, assessment_id: str
+    ) -> QuestionnaireComplete | None:
         """Return a cached QuestionnaireComplete if a completed session exists for this assessment."""
         try:
             from app.db.supabase import get_async_supabase_client_async
@@ -1415,7 +1564,9 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             sb = await get_async_supabase_client_async()
             result = (
                 await sb.table("questionnaire_sessions")
-                .select("id, generated_questions, total_controls, total_questions, generation_time_ms, agent_criteria")
+                .select(
+                    "id, generated_questions, total_controls, total_questions, generation_time_ms, agent_criteria"
+                )
                 .eq("assessment_id", assessment_id)
                 .eq("status", "completed")
                 .order("created_at", desc=True)
@@ -1459,9 +1610,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
                         serialized.append(block)
                     else:
                         serialized.append(str(block))
-                conversation.append(
-                    {"role": msg["role"], "content": serialized}
-                )
+                conversation.append({"role": msg["role"], "content": serialized})
             else:
                 conversation.append(msg)
         return conversation
@@ -1470,9 +1619,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
     # Active session persistence (survives restarts)
     # ------------------------------------------------------------------
 
-    async def _persist_active_session(
-        self, session: QuestionnaireSession
-    ) -> None:
+    async def _persist_active_session(self, session: QuestionnaireSession) -> None:
         """Upsert the active session state to Supabase so it survives restarts."""
         try:
             from app.db.supabase import get_async_supabase_client_async
@@ -1535,7 +1682,9 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             project_id = row["project_id"]
 
             # Re-fetch context and rebuild system prompt (not stored in DB)
-            context = await self._fetch_project_context(project_id)
+            context = await self._fetch_project_context(
+                project_id, client_id=row.get("client_id")
+            )
             system_prompt = self._build_system_prompt(context)
 
             messages = row.get("conversation_history") or []
@@ -1557,8 +1706,7 @@ Generate {q_count} depending on the criteria above. Ensure questions are specifi
             # Re-cache in memory
             _sessions[session_id] = session
             logger.info(
-                f"Session {session_id}: restored from DB "
-                f"({len(messages)} messages)"
+                f"Session {session_id}: restored from DB ({len(messages)} messages)"
             )
             return session
 

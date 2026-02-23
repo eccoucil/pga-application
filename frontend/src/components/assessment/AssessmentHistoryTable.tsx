@@ -14,7 +14,7 @@ interface AssessmentHistoryTableProps {
   assessments: AssessmentRecord[];
   onSelect: (id: string) => void;
   onNew: () => void;
-  onViewFindings?: (id: string) => void;
+  onViewQuestionnaire?: (id: string) => void;
 }
 
 const statusConfig: Record<
@@ -61,7 +61,7 @@ export function AssessmentHistoryTable({
   assessments,
   onSelect,
   onNew,
-  onViewFindings,
+  onViewQuestionnaire,
 }: AssessmentHistoryTableProps) {
   return (
     <div className="bg-[#0f1016]/60 backdrop-blur-md border border-white/10 rounded-2xl overflow-hidden shadow-2xl">
@@ -175,18 +175,18 @@ export function AssessmentHistoryTable({
                         <Eye className="w-3.5 h-3.5" />
                         View
                       </button>
-                      {onViewFindings &&
+                      {onViewQuestionnaire &&
                         (assessment.status === "received" ||
                           assessment.status === "completed") && (
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              onViewFindings(assessment.id);
+                              onViewQuestionnaire(assessment.id);
                             }}
                             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 rounded-lg hover:bg-emerald-500/20 hover:text-emerald-200 transition-all"
                           >
                             <CheckCircle className="w-3.5 h-3.5" />
-                            Findings
+                            Questionnaire
                           </button>
                         )}
                     </div>

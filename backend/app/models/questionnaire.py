@@ -14,12 +14,12 @@ class GenerateWithCriteriaRequest(BaseModel):
     )
 
     # Step 1: Assessment Profile
-    maturity_level: Literal[
-        "first_time_audit", "recurring_assessment", "mature_isms"
-    ] = Field(..., description="Organization's assessment maturity")
-    question_depth: Literal[
-        "high_level_overview", "balanced", "detailed_technical"
-    ] = Field(..., description="Desired question depth/count per control")
+    maturity_level: str = Field(
+        ..., description="Organization's assessment maturity"
+    )
+    question_depth: str = Field(
+        ..., description="Desired question depth/count per control"
+    )
 
     # Step 2: Focus & Priorities
     priority_domains: list[str] = Field(
@@ -31,6 +31,9 @@ class GenerateWithCriteriaRequest(BaseModel):
     )
     controls_to_skip: Optional[str] = Field(
         None, description="Controls to de-emphasize or skip"
+    )
+    questions_per_control: Optional[int] = Field(
+        None, description="Override questions per control (default 3)"
     )
 
 
@@ -96,5 +99,13 @@ class QuestionnaireComplete(BaseModel):
     criteria_summary: str
 
 
+class GenerationRedirect(BaseModel):
+    """Returned when the conversational agent triggers batch generation."""
+
+    session_id: str
+    type: Literal["generation_redirect"] = "generation_redirect"
+    criteria: dict
+
+
 # Union response type
-QuestionnaireResponse = AgentQuestion | QuestionnaireComplete
+QuestionnaireResponse = AgentQuestion | QuestionnaireComplete | GenerationRedirect

@@ -26,7 +26,6 @@ import type {
 } from "@/types/assessment";
 import { AssessmentHistoryTable } from "@/components/assessment/AssessmentHistoryTable";
 import { AssessmentFormCard } from "@/components/assessment/AssessmentFormCard";
-import { FindingsContent } from "@/components/assessment/FindingsContent";
 import { QuestionnaireContent } from "@/components/assessment/QuestionnaireContent";
 import {
   Loader2,
@@ -79,6 +78,15 @@ type StoredFormData = Pick<
   | "department"
   | "scopeStatementISMS"
 >;
+
+// Helper to normalize department field to comma-separated format
+function normalizeDepartment(dept: string | null | undefined): string {
+  if (!dept) return "";
+  // If it's already comma-separated, return as-is
+  if (dept.includes(",")) return dept;
+  // Otherwise, return as single department
+  return dept.trim();
+}
 
 function getStoredForm(projectId: string): StoredFormData | null {
   if (typeof window === "undefined") return null;
@@ -146,10 +154,7 @@ export default function AssessmentPage() {
   const [selectedAssessmentId, setSelectedAssessmentId] = useState<
     string | null
   >(null);
-  const [activeStep, setActiveStep] = useState<1 | 2 | 3>(1);
-  const [findingsData, setFindingsData] = useState<AssessmentResponse | null>(
-    null,
-  );
+  const [activeStep, setActiveStep] = useState<1 | 2>(1);
 
   const [formData, setFormData] = useState<FormData>({
     organizationName: "",
@@ -164,8 +169,7 @@ export default function AssessmentPage() {
   const [errors, setErrors] = useState<FormErrors>({});
   const [steps, setSteps] = useState<AssessmentStep[]>([
     { number: 1, title: "Scope", status: "current" },
-    { number: 2, title: "Findings", status: "upcoming" },
-    { number: 3, title: "Questionnaire", status: "upcoming" },
+    { number: 2, title: "Questionnaire", status: "upcoming" },
   ]);
 
   // ---------- URL sync ----------
@@ -210,7 +214,7 @@ export default function AssessmentPage() {
         natureOfBusiness: "",
         industryType: validIndustry,
         webDomain: ctx.web_domain ?? "",
-        department: ctx.department ?? "",
+        department: normalizeDepartment(ctx.department),
         scopeStatementISMS: ctx.scope_statement_preview ?? "",
         documents: prev.documents,
       }));
@@ -306,7 +310,8 @@ export default function AssessmentPage() {
       // Restore navigation state from URL if an assessment ID is present
       if (urlAssessmentId && list.some((a) => a.id === urlAssessmentId)) {
         const rawStep = Number(urlStep);
-        const step: 1 | 2 | 3 = rawStep === 2 ? 2 : rawStep === 3 ? 3 : 1;
+        // Backward compat: old ?step=2 or ?step=3 both map to new step 2 (Questionnaire)
+        const step: 1 | 2 = rawStep >= 2 ? 2 : 1;
         await handleSelectAssessment(urlAssessmentId, step);
       }
     };
@@ -348,46 +353,26 @@ export default function AssessmentPage() {
     formData.scopeStatementISMS,
   ]);
 
-  // Update stepper based on view mode, active step, and findings data
+  // Update stepper based on view mode and active step
   useEffect(() => {
-    if (viewMode === "view") {
-      if (activeStep === 3 && findingsData) {
-        setSteps([
-          { number: 1, title: "Scope", status: "completed" },
-          { number: 2, title: "Findings", status: "completed" },
-          { number: 3, title: "Questionnaire", status: "current" },
-        ]);
-      } else if (activeStep === 2 && findingsData) {
-        setSteps([
-          { number: 1, title: "Scope", status: "completed" },
-          { number: 2, title: "Findings", status: "current" },
-          { number: 3, title: "Questionnaire", status: "upcoming" },
-        ]);
-      } else {
-        setSteps([
-          { number: 1, title: "Scope", status: "current" },
-          {
-            number: 2,
-            title: "Findings",
-            status: findingsData ? "completed" : "upcoming",
-          },
-          { number: 3, title: "Questionnaire", status: "upcoming" },
-        ]);
-      }
+    if (viewMode === "view" && activeStep === 2) {
+      setSteps([
+        { number: 1, title: "Scope", status: "completed" },
+        { number: 2, title: "Questionnaire", status: "current" },
+      ]);
     } else {
       setSteps([
         { number: 1, title: "Scope", status: "current" },
-        { number: 2, title: "Findings", status: "upcoming" },
-        { number: 3, title: "Questionnaire", status: "upcoming" },
+        { number: 2, title: "Questionnaire", status: "upcoming" },
       ]);
     }
-  }, [viewMode, activeStep, findingsData]);
+  }, [viewMode, activeStep]);
 
   // ---------- Handlers ----------
 
   const handleSelectAssessment = async (
     id: string,
-    targetStep: 1 | 2 | 3 = 1,
+    targetStep: 1 | 2 = 1,
   ) => {
     try {
       const {
@@ -410,50 +395,14 @@ export default function AssessmentPage() {
         natureOfBusiness: detail.nature_of_business,
         industryType: detail.industry_type,
         webDomain: detail.web_domain || "",
-        department: detail.department,
+        department: normalizeDepartment(detail.department),
         scopeStatementISMS: detail.scope_statement_isms,
         documents: [],
       });
       setErrors({});
       setViewMode("view");
-
-      // Parse response_snapshot if available
-      let hasFindings = false;
-      if (detail.response_snapshot) {
-        setFindingsData(
-          detail.response_snapshot as unknown as AssessmentResponse,
-        );
-        hasFindings = true;
-      } else {
-        // Fallback: fetch from /assessment/findings endpoint
-        try {
-          const findingsRes = await fetch(
-            `${apiUrl}/assessment/findings?client_id=${encodeURIComponent(clientId)}&project_id=${encodeURIComponent(projectId)}`,
-            {
-              headers: {
-                ...(session?.access_token
-                  ? { Authorization: `Bearer ${session.access_token}` }
-                  : {}),
-              },
-            },
-          );
-          if (findingsRes.ok) {
-            const findingsJson: AssessmentResponse =
-              await findingsRes.json();
-            setFindingsData(findingsJson);
-            hasFindings = true;
-          } else {
-            setFindingsData(null);
-          }
-        } catch {
-          setFindingsData(null);
-        }
-      }
-
-      // Fall back to step 1 if requesting findings/questionnaire but no data
-      const resolvedStep = (targetStep > 1 && !hasFindings) ? 1 : targetStep;
-      setActiveStep(resolvedStep);
-      updateUrl(id, resolvedStep);
+      setActiveStep(targetStep);
+      updateUrl(id, targetStep);
     } catch {
       toast({
         title: "Error",
@@ -489,7 +438,7 @@ export default function AssessmentPage() {
             natureOfBusiness: detail.nature_of_business,
             industryType: detail.industry_type,
             webDomain: detail.web_domain || "",
-            department: detail.department,
+            department: normalizeDepartment(detail.department),
             scopeStatementISMS: detail.scope_statement_isms,
             documents: [],
           });
@@ -645,7 +594,7 @@ export default function AssessmentPage() {
     <DashboardLayout>
       <div
         className={`${
-          viewMode === "view" && (activeStep === 2 || activeStep === 3)
+          viewMode === "view" && activeStep === 2
             ? "max-w-6xl"
             : "max-w-4xl"
         } mx-auto pb-10 transition-all duration-300`}
@@ -753,7 +702,7 @@ export default function AssessmentPage() {
             assessments={assessments}
             onSelect={handleSelectAssessment}
             onNew={handleNewAssessment}
-            onViewFindings={(id) => handleSelectAssessment(id, 2)}
+            onViewQuestionnaire={(id) => handleSelectAssessment(id, 2)}
           />
         )}
 
@@ -766,19 +715,9 @@ export default function AssessmentPage() {
             <AssessmentStepper
               steps={steps}
               onStepClick={(stepNumber) => {
-                if (viewMode === "view") {
-                  if (stepNumber === 1) {
-                    setActiveStep(1);
-                    updateUrl(selectedAssessmentId, 1);
-                  }
-                  if (stepNumber === 2 && findingsData) {
-                    setActiveStep(2);
-                    updateUrl(selectedAssessmentId, 2);
-                  }
-                  if (stepNumber === 3 && findingsData) {
-                    setActiveStep(3);
-                    updateUrl(selectedAssessmentId, 3);
-                  }
+                if (viewMode === "view" && (stepNumber === 1 || stepNumber === 2)) {
+                  setActiveStep(stepNumber as 1 | 2);
+                  updateUrl(selectedAssessmentId, stepNumber);
                 }
               }}
             />
@@ -819,22 +758,14 @@ export default function AssessmentPage() {
                 }}
                 onEdit={() => setViewMode("edit")}
                 isSubmitting={isSubmitting}
-                onProceedToFindings={
-                  findingsData ? () => { setActiveStep(2); updateUrl(selectedAssessmentId, 2); } : undefined
+                onProceedToQuestionnaire={
+                  viewMode === "view" ? () => { setActiveStep(2); updateUrl(selectedAssessmentId, 2); } : undefined
                 }
               />
             )}
 
-            {/* Step 2: Findings (shown when activeStep === 2 in view mode) */}
-            {viewMode === "view" && activeStep === 2 && findingsData && (
-              <FindingsContent
-                data={findingsData}
-                onProceedToQuestionnaire={() => { setActiveStep(3); updateUrl(selectedAssessmentId, 3); }}
-              />
-            )}
-
-            {/* Step 3: Questionnaire (shown when activeStep === 3 in view mode) */}
-            {viewMode === "view" && activeStep === 3 && findingsData && (
+            {/* Step 2: Questionnaire (shown when activeStep === 2 in view mode) */}
+            {viewMode === "view" && activeStep === 2 && (
               <QuestionnaireContent projectId={projectId} frameworks={selectedProject?.framework ?? []} assessmentId={selectedAssessmentId ?? undefined} />
             )}
           </>

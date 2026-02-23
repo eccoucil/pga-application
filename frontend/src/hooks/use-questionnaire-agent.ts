@@ -4,7 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import type {
   AgentQuestion,
+  ControlQuestions,
   GenerateWithCriteriaRequest,
+  GenerationRedirect,
   QuestionnaireComplete,
   QuestionnaireResponse,
 } from "@/types/questionnaire";
@@ -55,6 +57,7 @@ interface UseQuestionnaireAgentReturn {
   error: string | null;
   progress: GenerationProgress | null;
   agentProgress: Map<number, AgentStatus>;
+  streamingControls: ControlQuestions[];
   startSession: (projectId: string, assessmentId?: string) => Promise<void>;
   generateWithCriteria: (
     criteria: GenerateWithCriteriaRequest,
@@ -111,6 +114,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
   const [agentProgress, setAgentProgress] = useState<Map<number, AgentStatus>>(
     new Map(),
   );
+  const [streamingControls, setStreamingControls] = useState<ControlQuestions[]>([]);
 
   // Track the session_id returned by the agent
   const sessionIdRef = useRef<string | null>(null);
@@ -128,18 +132,21 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
   }, []);
 
   // Handle a response from the agent (either question or complete)
-  const handleResponse = useCallback((data: QuestionnaireResponse) => {
-    if (data.type === "question") {
-      sessionIdRef.current = data.session_id;
-      setCurrentQuestion(data);
-      setState("conversing");
-    } else {
-      sessionIdRef.current = data.session_id;
-      setResult(data);
-      setCurrentQuestion(null);
-      setState("complete");
-    }
-  }, []);
+  const handleResponse = useCallback(
+    (data: AgentQuestion | QuestionnaireComplete) => {
+      if (data.type === "question") {
+        sessionIdRef.current = data.session_id;
+        setCurrentQuestion(data);
+        setState("conversing");
+      } else {
+        sessionIdRef.current = data.session_id;
+        setResult(data);
+        setCurrentQuestion(null);
+        setState("complete");
+      }
+    },
+    [],
+  );
 
   const startSession = useCallback(
     async (projectId: string, assessmentId?: string) => {
@@ -156,7 +163,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
       abortRef.current = controller;
 
       try {
-        const data = await post<QuestionnaireResponse>(
+        const data = await post<AgentQuestion | QuestionnaireComplete>(
           "/questionnaire/generate-question",
           {
             project_id: projectId,
@@ -176,46 +183,6 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     [handleResponse],
   );
 
-  const submitAnswer = useCallback(
-    async (answer: string) => {
-      if (!sessionIdRef.current || !currentQuestion) return;
-
-      // Archive current Q&A
-      setAnsweredQuestions((prev) => [
-        ...prev,
-        {
-          question: currentQuestion.question,
-          context: currentQuestion.context,
-          options: currentQuestion.options,
-          answer,
-        },
-      ]);
-      setCurrentQuestion(null);
-      setState("generating");
-
-      abortRef.current?.abort();
-      const controller = new AbortController();
-      abortRef.current = controller;
-
-      try {
-        const data = await post<QuestionnaireResponse>(
-          "/questionnaire/respond",
-          {
-            session_id: sessionIdRef.current,
-            answer,
-          },
-          controller.signal,
-        );
-        handleResponse(data);
-      } catch (e) {
-        if (controller.signal.aborted) return; // cancelled by unmount or new request
-        setError(e instanceof Error ? e.message : "Failed to submit answer");
-        setState("error");
-      }
-    },
-    [currentQuestion, handleResponse],
-  );
-
   const generateWithCriteria = useCallback(
     async (criteria: GenerateWithCriteriaRequest) => {
       setState("generating");
@@ -223,6 +190,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
       setResult(null);
       setProgress(null);
       setAgentProgress(new Map());
+      setStreamingControls([]);
 
       abortRef.current?.abort();
       const controller = new AbortController();
@@ -310,9 +278,14 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
                   });
                   return next;
                 });
+                // Append this agent's controls for early rendering
+                if (data.controls && Array.isArray(data.controls)) {
+                  setStreamingControls((prev) => [...prev, ...data.controls]);
+                }
               } else if (currentEvent === "complete") {
                 setResult(data);
                 setProgress(null);
+                setStreamingControls([]); // Final result is now authoritative
                 setState("complete");
               } else if (currentEvent === "error") {
                 throw new Error(data.error || "Generation failed");
@@ -330,6 +303,52 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
       }
     },
     [],
+  );
+
+  const submitAnswer = useCallback(
+    async (answer: string) => {
+      if (!sessionIdRef.current || !currentQuestion) return;
+
+      // Archive current Q&A
+      setAnsweredQuestions((prev) => [
+        ...prev,
+        {
+          question: currentQuestion.question,
+          context: currentQuestion.context,
+          options: currentQuestion.options,
+          answer,
+        },
+      ]);
+      setCurrentQuestion(null);
+      setState("generating");
+
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        const data = await post<QuestionnaireResponse>(
+          "/questionnaire/respond",
+          {
+            session_id: sessionIdRef.current,
+            answer,
+          },
+          controller.signal,
+        );
+
+        if (data.type === "generation_redirect") {
+          // Switch to SSE streaming — reuses all TTFT infrastructure
+          void generateWithCriteria(data.criteria as GenerateWithCriteriaRequest);
+          return;
+        }
+        handleResponse(data);
+      } catch (e) {
+        if (controller.signal.aborted) return; // cancelled by unmount or new request
+        setError(e instanceof Error ? e.message : "Failed to submit answer");
+        setState("error");
+      }
+    },
+    [currentQuestion, handleResponse, generateWithCriteria],
   );
 
   const retry = useCallback(() => {
@@ -350,6 +369,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     setError(null);
     setProgress(null);
     setAgentProgress(new Map());
+    setStreamingControls([]);
     sessionIdRef.current = null;
   }, []);
 
@@ -361,6 +381,7 @@ export function useQuestionnaireAgent(): UseQuestionnaireAgentReturn {
     error,
     progress,
     agentProgress,
+    streamingControls,
     startSession,
     generateWithCriteria,
     submitAnswer,

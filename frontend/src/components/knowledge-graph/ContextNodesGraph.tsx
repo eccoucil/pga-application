@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -16,6 +16,7 @@ import {
   Position,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { Info, ChevronDown, ChevronUp } from "lucide-react";
 import type { KnowledgeGraph } from "@/types/assessment";
 
 interface ContextNodesGraphProps {
@@ -103,6 +104,7 @@ const RING_1_RADIUS = 250;
 const RING_2_RADIUS = 450;
 
 export function ContextNodesGraph({ knowledgeGraph }: ContextNodesGraphProps) {
+  const [showInfo, setShowInfo] = useState(true);
   // Radial layout: hub at center, children on concentric rings
   const initialNodes = useMemo<Node[]>(() => {
     if (!knowledgeGraph?.nodes || knowledgeGraph.nodes.length === 0) return [];
@@ -241,37 +243,127 @@ export function ContextNodesGraph({ knowledgeGraph }: ContextNodesGraphProps) {
   }
 
   return (
-    <div className="h-[500px] w-full bg-white rounded-lg border border-gray-200 overflow-hidden">
-      <ReactFlow
-        nodes={reactFlowNodes}
-        edges={reactFlowEdges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
-        nodeTypes={nodeTypes}
-        fitView
-        className="bg-white"
-        defaultViewport={{ x: 0, y: 0, zoom: 0.7 }}
-        nodesDraggable={true}
-        nodesConnectable={false}
-        edgesFocusable={true}
-        defaultEdgeOptions={{
-          animated: false,
-          style: { stroke: "#9ca3af", strokeWidth: 1, opacity: 1 },
-        }}
-        proOptions={{ hideAttribution: true }}
-      >
-        <Background color="#e5e7eb" gap={16} size={1} />
-        <Controls
-          className="bg-white border border-gray-200 rounded-lg shadow-sm"
-          style={{ color: "#374151" }}
-        />
-        <MiniMap
-          className="bg-white border border-gray-200 rounded-lg shadow-sm"
-          nodeColor={(node) => (node.type === "hub" ? "#facc15" : "#14b8a6")}
-          maskColor="rgba(0, 0, 0, 0.08)"
-        />
-      </ReactFlow>
+    <div className="space-y-4">
+      {/* Info Banner */}
+      <div className="bg-slate-900/40 border border-cyan-500/20 rounded-lg overflow-hidden">
+        <button
+          onClick={() => setShowInfo(!showInfo)}
+          className="w-full flex items-start gap-3 p-4 hover:bg-slate-800/40 transition-colors text-left"
+        >
+          <Info className="w-5 h-5 text-cyan-400 flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-white mb-1">
+              Knowledge Graph Overview
+            </p>
+            {showInfo && (
+              <p className="text-xs text-slate-300 leading-relaxed">
+                This graph visualizes the relationships between your organization, digital assets, policies, and documents discovered during the assessment. Nodes are arranged radially with the organization at the center, showing how different compliance entities connect and relate to each other.
+              </p>
+            )}
+          </div>
+          <div className="flex-shrink-0 mt-0.5">
+            {showInfo ? (
+              <ChevronUp className="w-4 h-4 text-slate-400" />
+            ) : (
+              <ChevronDown className="w-4 h-4 text-slate-400" />
+            )}
+          </div>
+        </button>
+
+        {/* Legend */}
+        {showInfo && (
+          <div className="px-4 pb-4 pt-2 border-t border-slate-700/50 space-y-3">
+            <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">
+              Node Types
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {/* Hub Node */}
+              <div className="flex items-center gap-3 p-2 bg-slate-800/30 rounded border border-slate-700/50">
+                <div
+                  className="w-12 h-8 rounded-full border border-amber-600/30 flex items-center justify-center flex-shrink-0"
+                  style={{ backgroundColor: "#facc15" }}
+                >
+                  <span className="text-black text-xs font-bold">Org</span>
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-white">
+                    Organization / Hub
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    Central node representing your organization
+                  </p>
+                </div>
+              </div>
+
+              {/* Entity Node */}
+              <div className="flex items-center gap-3 p-2 bg-slate-800/30 rounded border border-slate-700/50">
+                <div
+                  className="w-8 h-8 rounded-full border border-teal-700/30 flex items-center justify-center flex-shrink-0"
+                  style={{ backgroundColor: "#14b8a6" }}
+                >
+                  <span className="text-black text-xs font-bold">A</span>
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-white">
+                    Entity Node
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    Assets, policies, documents, and other related items
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Connections */}
+            <div className="pt-2">
+              <p className="text-xs font-medium text-slate-400 uppercase tracking-wider mb-2">
+                Connections
+              </p>
+              <p className="text-xs text-slate-300 flex items-center gap-2">
+                <span
+                  className="inline-block w-4 h-px"
+                  style={{ backgroundColor: "#9ca3af" }}
+                />
+                Lines show relationships and dependencies between entities
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ReactFlow Graph */}
+      <div className="h-[500px] w-full bg-white rounded-lg border border-gray-200 overflow-hidden">
+        <ReactFlow
+          nodes={reactFlowNodes}
+          edges={reactFlowEdges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          nodeTypes={nodeTypes}
+          fitView
+          className="bg-white"
+          defaultViewport={{ x: 0, y: 0, zoom: 0.7 }}
+          nodesDraggable={true}
+          nodesConnectable={false}
+          edgesFocusable={true}
+          defaultEdgeOptions={{
+            animated: false,
+            style: { stroke: "#9ca3af", strokeWidth: 1, opacity: 1 },
+          }}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background color="#e5e7eb" gap={16} size={1} />
+          <Controls
+            className="bg-white border border-gray-200 rounded-lg shadow-sm"
+            style={{ color: "#374151" }}
+          />
+          <MiniMap
+            className="bg-white border border-gray-200 rounded-lg shadow-sm"
+            nodeColor={(node) => (node.type === "hub" ? "#facc15" : "#14b8a6")}
+            maskColor="rgba(0, 0, 0, 0.08)"
+          />
+        </ReactFlow>
+      </div>
     </div>
   );
 }
