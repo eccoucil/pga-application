@@ -51,6 +51,7 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/pyproject.toml /app/uv.lock ./
 COPY --from=builder /app/app ./app
+COPY --from=builder /app/docs ./docs
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1

@@ -12,3 +12,4 @@ scripts/
 docker-compose.yml
 Dockerfile
 *.md
+!docs/**/*.md

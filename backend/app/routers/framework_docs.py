@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/framework-docs", tags=["framework-docs"])
 
-DOCS_DIR = Path(__file__).resolve().parents[3] / "docs" / "framework"
+DOCS_DIR = Path(__file__).resolve().parents[2] / "docs" / "framework"
 ANNEX_A_PATH = DOCS_DIR / "iso27001-2022-annex-a-controls.md"
 MGMT_CLAUSES_PATH = DOCS_DIR / "iso27001-2022-management-clauses.md"
 BNM_RMIT_PATH = DOCS_DIR / "bnm-rmit-policy-requirements.md"
