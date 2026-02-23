@@ -404,7 +404,7 @@ export function FindingsContent({ data, onProceedToQuestionnaire }: FindingsCont
                             {String(asset.asset_type)}
                           </span>
                         )}
-                        {asset.url != null && (
+                        {asset.url != null && /^https?:\/\//i.test(String(asset.url)) ? (
                           <a
                             href={String(asset.url)}
                             target="_blank"
@@ -413,7 +413,11 @@ export function FindingsContent({ data, onProceedToQuestionnaire }: FindingsCont
                           >
                             {String(asset.url)}
                           </a>
-                        )}
+                        ) : asset.url != null ? (
+                          <span className="text-sm text-slate-400 truncate max-w-md">
+                            {String(asset.url)}
+                          </span>
+                        ) : null}
                         {asset.name != null && asset.url == null && (
                           <span className="text-sm text-white">
                             {String(asset.name)}

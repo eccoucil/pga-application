@@ -1,11 +1,15 @@
 """Authentication dependencies for FastAPI."""
 
+import logging
+
 import httpx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 security = HTTPBearer()
 
@@ -91,13 +95,32 @@ async def get_current_user(
             "role": payload.get("role"),
         }
     except JWTError as e:
+        logger.warning(f"JWT validation failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid authentication token: {str(e)}",
+            detail="Invalid authentication token",
             headers={"WWW-Authenticate": "Bearer"},
         )
     except httpx.HTTPError as e:
+        logger.error(f"JWKS fetch failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Unable to verify token: {str(e)}",
+            detail="Authentication service unavailable",
         )
+
+
+async def verify_client_membership(client_id: str, user_id: str) -> dict:
+    """Verify user is a member of the client organization. Returns membership record."""
+    from app.db.supabase import get_async_supabase_client_async
+
+    supabase = await get_async_supabase_client_async()
+    result = await (
+        supabase.table("client_members")
+        .select("role")
+        .eq("client_id", client_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=403, detail="Not a member of this client")
+    return result.data[0]

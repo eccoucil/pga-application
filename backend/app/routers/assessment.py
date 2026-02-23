@@ -1,10 +1,12 @@
 """Assessment submission router."""
 
+import ipaddress
 import logging
+import socket
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, verify_client_membership
 from app.models.assessment import (
     AssessmentDetailResponse,
     AssessmentListResponse,
@@ -25,6 +27,40 @@ from app.services.assessment_orchestrator import get_orchestrator
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/assessment", tags=["assessment"])
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILES = 20
+
+
+def _validate_web_domain(domain: str) -> str:
+    """Validate domain is a public hostname, not an internal/private address."""
+    cleaned = domain.strip().lower()
+    for prefix in ("https://", "http://"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+    cleaned = cleaned.split("/")[0].split(":")[0]  # Remove path and port
+
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Invalid web domain")
+
+    blocked = {"localhost", "0.0.0.0", "metadata.google.internal", "169.254.169.254"}
+    if cleaned in blocked:
+        raise HTTPException(status_code=400, detail="Internal addresses are not allowed")
+
+    try:
+        addr_info = socket.getaddrinfo(cleaned, None)
+        for _, _, _, _, sockaddr in addr_info:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                raise HTTPException(
+                    status_code=400, detail="Domain resolves to a private address"
+                )
+    except socket.gaierror:
+        raise HTTPException(
+            status_code=400, detail=f"Cannot resolve domain: {cleaned}"
+        )
+
+    return cleaned
 
 
 async def _persist_assessment(
@@ -90,8 +126,12 @@ async def submit_assessment(
     Returns acknowledgment with assessment_id for tracking.
     Documents are queued for processing by downstream agents.
     """
-    # Validate file types if documents are provided
+    # Validate file types and sizes if documents are provided
     if documents:
+        if len(documents) > MAX_FILES:
+            raise HTTPException(
+                status_code=400, detail=f"Maximum {MAX_FILES} files allowed"
+            )
         allowed_extensions = {".pdf", ".docx", ".doc", ".txt", ".xlsx", ".xls", ".csv"}
         for doc in documents:
             if doc.filename:
@@ -105,6 +145,17 @@ async def submit_assessment(
                         status_code=400,
                         detail=f"Unsupported file type: {doc.filename}. Allowed: {', '.join(allowed_extensions)}",
                     )
+            content = await doc.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {doc.filename} exceeds 50MB limit",
+                )
+            await doc.seek(0)
+
+    # Validate web domain (SSRF protection)
+    if web_domain:
+        web_domain = _validate_web_domain(web_domain)
 
     # Build request from form data
     request = AssessmentRequest(
@@ -143,6 +194,8 @@ async def list_assessments(
     current_user: dict = Depends(get_current_user),
 ) -> AssessmentListResponse:
     """List all assessments for a project."""
+    await verify_client_membership(client_id, current_user["user_id"])
+
     from app.db.supabase import get_supabase_client
 
     sb = get_supabase_client()
@@ -173,6 +226,8 @@ async def get_findings_for_project(
     can load real data. Sources data from assessments, web_crawl_results,
     and project_documents tables.
     """
+    await verify_client_membership(client_id, current_user["user_id"])
+
     from app.db.supabase import get_async_supabase_client_async
 
     sb = await get_async_supabase_client_async()

@@ -104,7 +104,7 @@ def _parse_annex_a(text: str) -> list[AnnexASection]:
 
 
 @router.get("/annex-a", response_model=AnnexAResponse)
-async def get_annex_a():
+async def get_annex_a(current_user: dict = Depends(get_current_user)):
     """Return all Annex A controls parsed from the markdown reference file."""
     if not ANNEX_A_PATH.exists():
         raise HTTPException(status_code=404, detail="Annex A markdown file not found")
@@ -201,7 +201,7 @@ def _parse_management_clauses(text: str) -> list[ManagementClause]:
 
 
 @router.get("/management-clauses", response_model=ManagementClausesResponse)
-async def get_management_clauses():
+async def get_management_clauses(current_user: dict = Depends(get_current_user)):
     """Return all management clauses (4-10) parsed from the markdown reference file."""
     if not MGMT_CLAUSES_PATH.exists():
         raise HTTPException(status_code=404, detail="Management Clauses markdown file not found")
@@ -358,7 +358,7 @@ def _parse_bnm_rmit(text: str) -> list[BnmRmitSection]:
 
 
 @router.get("/bnm-rmit", response_model=BnmRmitResponse)
-async def get_bnm_rmit():
+async def get_bnm_rmit(current_user: dict = Depends(get_current_user)):
     """Return all BNM RMIT policy requirements parsed from the markdown reference file."""
     if not BNM_RMIT_PATH.exists():
         raise HTTPException(status_code=404, detail="BNM RMIT markdown file not found")

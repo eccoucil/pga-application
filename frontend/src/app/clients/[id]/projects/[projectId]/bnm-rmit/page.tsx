@@ -6,7 +6,7 @@ import { DashboardLayout } from "@/components/layout/DashboardLayout"
 import { useClient } from "@/contexts/ClientContext"
 import { useProject } from "@/contexts/ProjectContext"
 import { useAuth } from "@/contexts/AuthContext"
-import { getClient, getProject } from "@/lib/supabase"
+import { supabase, getClient, getProject } from "@/lib/supabase"
 import { Loader2, Search, ChevronDown, ChevronRight, Landmark } from "lucide-react"
 
 interface BnmRmitRequirement {
@@ -89,7 +89,11 @@ export default function BnmRmitPage() {
       setLoading(true)
       setError(null)
       try {
-        const res = await fetch(`${API_URL}/framework-docs/bnm-rmit`)
+        const { data: { session } } = await supabase.auth.getSession()
+        const authHeaders: Record<string, string> = session?.access_token
+          ? { Authorization: `Bearer ${session.access_token}` }
+          : {}
+        const res = await fetch(`${API_URL}/framework-docs/bnm-rmit`, { headers: authHeaders })
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const data = await res.json()
         setSections(data.sections)

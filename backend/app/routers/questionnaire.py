@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from app.auth.dependencies import get_current_user
+from app.auth.dependencies import get_current_user, verify_client_membership
 from app.models.questionnaire import (
     GenerateQuestionRequest,
     GenerateWithCriteriaRequest,
@@ -118,7 +118,16 @@ async def list_sessions(
     """List questionnaire sessions for a project, optionally filtered by assessment."""
     from app.db.supabase import get_async_supabase_client_async
 
+    # Verify membership by looking up the project's client_id
     sb = await get_async_supabase_client_async()
+    project_res = await (
+        sb.table("projects").select("client_id").eq("id", project_id).limit(1).execute()
+    )
+    if project_res.data:
+        await verify_client_membership(
+            project_res.data[0]["client_id"], current_user["user_id"]
+        )
+
     query = (
         sb.table("questionnaire_sessions")
         .select(
@@ -153,4 +162,20 @@ async def get_session(
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Verify membership via the session's project → client relationship
+    project_id = result.data.get("project_id")
+    if project_id:
+        project_res = await (
+            sb.table("projects")
+            .select("client_id")
+            .eq("id", project_id)
+            .limit(1)
+            .execute()
+        )
+        if project_res.data:
+            await verify_client_membership(
+                project_res.data[0]["client_id"], current_user["user_id"]
+            )
+
     return result.data

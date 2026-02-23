@@ -1,5 +1,6 @@
 """Framework router for ISO 27001 and BNM RMIT sections."""
 
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -229,6 +230,11 @@ async def get_iso27001_section_details(
     Args:
         section_id: Section identifier (e.g., "A.5", "6")
     """
+    if not re.match(r"^A\.\d{1,2}$|^\d{1,2}$", section_id):
+        raise HTTPException(
+            status_code=400, detail="Invalid section identifier format"
+        )
+
     settings = get_settings()
 
     from supabase import create_client

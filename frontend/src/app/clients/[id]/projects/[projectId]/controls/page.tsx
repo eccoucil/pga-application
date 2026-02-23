@@ -6,7 +6,7 @@ import { DashboardLayout } from "@/components/layout/DashboardLayout"
 import { useClient } from "@/contexts/ClientContext"
 import { useProject } from "@/contexts/ProjectContext"
 import { useAuth } from "@/contexts/AuthContext"
-import { getClient, getProject } from "@/lib/supabase"
+import { supabase, getClient, getProject } from "@/lib/supabase"
 import { EditableControlCard } from "@/components/framework/EditableControlCard"
 import { Loader2, Search, ChevronDown, ChevronRight, ShieldCheck, Pencil, Check, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -94,9 +94,14 @@ export default function ControlsPage() {
       setLoading(true)
       setError(null)
       try {
+        const { data: { session } } = await supabase.auth.getSession()
+        const authHeaders: Record<string, string> = session?.access_token
+          ? { Authorization: `Bearer ${session.access_token}` }
+          : {}
+
         const [annexRes, clausesRes] = await Promise.all([
-          fetch(`${API_URL}/framework-docs/annex-a`),
-          fetch(`${API_URL}/framework-docs/management-clauses`),
+          fetch(`${API_URL}/framework-docs/annex-a`, { headers: authHeaders }),
+          fetch(`${API_URL}/framework-docs/management-clauses`, { headers: authHeaders }),
         ])
         if (!annexRes.ok) throw new Error(`Annex A: HTTP ${annexRes.status}`)
         if (!clausesRes.ok) throw new Error(`Management Clauses: HTTP ${clausesRes.status}`)
@@ -146,9 +151,13 @@ export default function ControlsPage() {
 
   // Annex A save
   const handleAnnexSave = async (controlId: string, title: string, description: string) => {
+    const { data: { session } } = await supabase.auth.getSession()
     const res = await fetch(`${API_URL}/framework-docs/annex-a/${controlId}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {}),
+      },
       body: JSON.stringify({ title, description }),
     })
     if (!res.ok) throw new Error("Failed to save")
@@ -176,9 +185,13 @@ export default function ControlsPage() {
   const handleClauseSave = async (subClauseId: string) => {
     setSaving(true)
     try {
+      const { data: { session } } = await supabase.auth.getSession()
       const res = await fetch(`${API_URL}/framework-docs/management-clauses/${subClauseId}`, {
         method: "PUT",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : {}),
+        },
         body: JSON.stringify({ content: editContent }),
       })
       if (!res.ok) throw new Error("Failed to save")
