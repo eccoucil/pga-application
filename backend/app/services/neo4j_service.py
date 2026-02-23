@@ -1,6 +1,7 @@
 """Neo4j service for knowledge graph operations."""
 
 import logging
+import re
 from typing import Optional
 
 from neo4j import AsyncGraphDatabase, AsyncDriver
@@ -1012,12 +1013,18 @@ class Neo4jService:
 
             # Set extracted data properties separately (to handle dynamic keys)
             if flat_data:
-                set_clause = ", ".join(f"d.{key} = ${key}" for key in flat_data.keys())
-                update_query = f"""
-                MATCH (d:ExtractedDocument) WHERE elementId(d) = $doc_id
-                SET {set_clause}
-                """
-                await session.run(update_query, doc_id=doc_id, **flat_data)
+                _SAFE_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+                safe_data = {k: v for k, v in flat_data.items() if _SAFE_KEY_RE.match(k)}
+                if safe_data:
+                    set_clause = ", ".join(f"d.{key} = ${key}" for key in safe_data.keys())
+                    update_query = f"""
+                    MATCH (d:ExtractedDocument) WHERE elementId(d) = $doc_id
+                    SET {set_clause}
+                    """
+                    await session.run(update_query, doc_id=doc_id, **safe_data)
+                rejected = set(flat_data.keys()) - set(safe_data.keys())
+                if rejected:
+                    logger.warning(f"Rejected unsafe Neo4j property keys: {rejected}")
 
         return doc_id
 

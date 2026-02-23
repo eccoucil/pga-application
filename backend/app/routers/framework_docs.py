@@ -3,8 +3,10 @@
 import re
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+
+from app.auth.dependencies import get_current_user
 
 router = APIRouter(prefix="/framework-docs", tags=["framework-docs"])
 
@@ -111,7 +113,7 @@ async def get_annex_a():
 
 
 @router.put("/annex-a/{control_id}")
-async def update_annex_a_control(control_id: str, body: UpdateControlBody):
+async def update_annex_a_control(control_id: str, body: UpdateControlBody, current_user: dict = Depends(get_current_user)):
     """Update a single Annex A control's title and description in the markdown file."""
     if not ANNEX_A_PATH.exists():
         raise HTTPException(status_code=404, detail="Annex A markdown file not found")
@@ -208,7 +210,7 @@ async def get_management_clauses():
 
 
 @router.put("/management-clauses/{clause_id}")
-async def update_management_clause(clause_id: str, body: UpdateClauseBody):
+async def update_management_clause(clause_id: str, body: UpdateClauseBody, current_user: dict = Depends(get_current_user)):
     """Update a sub-clause's content in the management clauses markdown file.
 
     clause_id should be a sub-clause identifier like '4.1', '5.2', etc.

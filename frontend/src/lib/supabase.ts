@@ -17,6 +17,15 @@ if (!supabaseUrl || !supabaseKey) {
 export const supabase = createClient(supabaseUrl, supabaseKey)
 
 /**
+ * Sanitize user input for use in PostgREST filter expressions.
+ * Strips characters that are meaningful in the filter DSL (commas, dots, parens)
+ * to prevent filter injection.
+ */
+function sanitizeFilterInput(input: string): string {
+  return input.replace(/[.,()]/g, '')
+}
+
+/**
  * Extended Client type that includes the user's role (from membership)
  */
 export interface ClientWithRole extends Client {
@@ -90,9 +99,10 @@ export async function getClients(
     .eq('client_members.user_id', userId)
     .order('created_at', { ascending: false })
 
-  // Apply search filter
+  // Apply search filter (sanitize to prevent PostgREST filter injection)
   if (filters?.search) {
-    query = query.or(`name.ilike.%${filters.search}%,company.ilike.%${filters.search}%,email.ilike.%${filters.search}%`)
+    const s = sanitizeFilterInput(filters.search)
+    query = query.or(`name.ilike.%${s}%,company.ilike.%${s}%,email.ilike.%${s}%`)
   }
 
   // Apply status filter
@@ -146,9 +156,10 @@ export async function getOwnedClients(
     .eq('client_members.role', 'owner')
     .order('created_at', { ascending: false })
 
-  // Apply search filter
+  // Apply search filter (sanitize to prevent PostgREST filter injection)
   if (filters?.search) {
-    query = query.or(`name.ilike.%${filters.search}%,company.ilike.%${filters.search}%,email.ilike.%${filters.search}%`)
+    const s = sanitizeFilterInput(filters.search)
+    query = query.or(`name.ilike.%${s}%,company.ilike.%${s}%,email.ilike.%${s}%`)
   }
 
   // Apply status filter
@@ -267,9 +278,10 @@ export async function getProjects(
     .eq('client_id', clientId)
     .order('created_at', { ascending: false })
 
-  // Apply search filter
+  // Apply search filter (sanitize to prevent PostgREST filter injection)
   if (filters?.search) {
-    query = query.or(`name.ilike.%${filters.search}%,description.ilike.%${filters.search}%`)
+    const s = sanitizeFilterInput(filters.search)
+    query = query.or(`name.ilike.%${s}%,description.ilike.%${s}%`)
   }
 
   // Apply status filter
